@@ -233,13 +233,85 @@ github_probe_success{cluster="${CLUSTER}"} 1
 EOF
 ```
 
-### 2.4 UX设计
+### 2.4 告警规则管理模型
+
+> 设计目标：在统一集中告警的基础上，允许不同业务集群按需定制额外规则，兼顾一致性和灵活性。
+
+**设计说明/归档:** 采用"通用规则集中维护 + 集群定制规则分散提交"的混合模型。通用规则由监控团队统一管理，集群定制规则由各业务团队自主提交、监控团队 review 后合入。
+
+**规则目录结构：**
+
+```
+中心 Prometheus 规则加载路径: /etc/prometheus/rules/
+
+rules/
+├── common/                    ← 监控团队维护，全体集群生效
+│   ├── infra.yaml             ← GitHub/云账号/证书等 9 条通用巡检告警
+│   └── k8s-health.yaml        ← Runner/DaemonSet/Pending Pod 等 K8s 健康告警
+│
+└── clusters/                  ← 各业务团队自助提交（可选）
+    ├── prod-sh-1.yaml         ← 集群 A 的定制规则
+    ├── staging.yaml           ← 集群 B 的定制规则
+    └── README.md              ← 提交规范说明
+```
+
+**Prometheus 加载配置：**
+
+```yaml
+rule_files:
+  - /etc/prometheus/rules/common/*.yaml
+  - /etc/prometheus/rules/clusters/*.yaml
+```
+
+**业务团队提交定制规则流程：**
+
+1. 业务团队在 Git 仓库中创建 `rules/clusters/<cluster-name>.yaml`
+2. 所有定制规则必须限定 `cluster` 标签，例如：
+
+```yaml
+groups:
+  - name: prod-sh-1-custom
+    rules:
+      - alert: CustomAppErrorRate
+        expr: |
+          rate(http_requests_total{cluster="prod-sh-1", status=~"5.."}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: WARNING
+          cluster: prod-sh-1
+        annotations:
+          summary: "集群 prod-sh-1 自定义应用错误率超标"
+```
+
+3. 提交 MR，监控团队 review 以下事项后合入：
+   - 规则是否通过 `promtool check rules` 语法校验
+   - 是否限定 `cluster` 标签（未限定的拒绝合入，防止误报到其他集群）
+   - 指标是否存在（需对应集群已暴露该指标）
+   - 告警级别和名称不与通用规则冲突
+
+4. ArgoCD 检测到 Git 变更后自动 reload Prometheus
+
+**两条硬约束：**
+
+| 约束 | 说明 |
+|------|------|
+| **必须限定 cluster** | 每条定制规则的 `expr` 必须包含 `cluster="<集群名>"`，review 时重点检查，违反此条直接拒绝 |
+| **不走动态加载** | Prometheus 不支持动态加载规则文件。规则变更通过 Git → ArgoCD → reload 路径，有审计记录可回滚 |
+
+**通用规则 vs 定制规则的归属：**
+
+| 规则类型 | 维护者 | 生效范围 | 示例 |
+|---------|--------|---------|------|
+| 通用规则 | 监控团队 | 所有集群 | GithubUnreachable, CloudAccountFrozen, RunnerDown |
+| 集群定制 | 业务团队提交，监控团队 review | 仅指定集群 | 某集群特有的应用错误率、业务指标异常 |
+
+### 2.5 UX设计
 
 > 设计目标：确保功能不仅"可用"，而且"好用"，降低开发者的认知负担和运维人员的误操作风险。 **不涉及需要说明原因**
 
 **设计说明/归档:** 不涉及，本系统为基础设施监控平台，无面向终端用户的 UI 交互。运维人员通过 Grafana 看板（社区标准仪表盘）和邮件通知交互，无需额外 UX 设计。
 
-### 2.5 SOD设计
+### 2.6 SOD设计
 
 > 设计目标：通过维护SOD权限设计文档，确保权限设计可审计、可复用、可跨服务重用。 SOD权限设计参考[XX SOD权限设计.md](XX%20SOD%E6%9D%83%E9%99%90%E8%AE%BE%E8%AE%A1.md)
 >
@@ -252,7 +324,7 @@ EOF
 - 业务集群 `monitoring` 命名空间：仅部署采集器，无需访问中心集群
 - 告警路由由办公软件机器人侧管理（不同集群通知不同运维组），监控系统自身不感知人员分工
 
-### 2.6 功能设计分解TASK清单
+### 2.7 功能设计分解TASK清单
 
 **设计说明/归档:** 基于架构设计，将功能拆解为 8 个 Phase，对应实施计划中的各阶段任务。
 
