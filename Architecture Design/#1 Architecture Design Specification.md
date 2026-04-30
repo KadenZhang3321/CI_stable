@@ -1,4 +1,4 @@
-# #1 多集群基础设施主动监控体系 架构设计说明书 (Architecture Design Document)
+# #1 CI 基础设施多集群主动监控体系 架构设计说明书 (Architecture Design Document)
 
 ---
 
@@ -180,13 +180,49 @@ github_probe_success{cluster="${CLUSTER}"} 1
 EOF
 ```
 
-### 2.4 UX设计
+### 2.4 多团队共享中心 Prometheus
+
+**设计说明/归档:** 中心 Prometheus 不只服务于 CI 基础设施——其他团队（如日志、应用监控等）可共用同一个 Prometheus 集群，通过规则文件目录隔离实现各自独立的告警管理。
+
+**目录结构：**
+
+```
+/etc/prometheus/rules/
+├── infra-ci/          ← CI 基础设施团队维护
+│   └── ci-alerts.yaml
+├── team-b/            ← 团队 B 维护
+│   └── b-alerts.yaml
+└── team-c/            ← 团队 C 维护
+    └── c-alerts.yaml
+```
+
+**Prometheus 加载所有目录：**
+
+```yaml
+rule_files:
+  - /etc/prometheus/rules/infra-ci/*.yaml
+  - /etc/prometheus/rules/team-b/*.yaml
+  - /etc/prometheus/rules/team-c/*.yaml
+```
+
+**隔离原则：**
+
+| 机制 | 说明 |
+|------|------|
+| **标签过滤** | 每个团队的规则 `expr` 必须限定自己的标签（如 CI 团队用 `job=~".*ci.*"` 或 `cluster` 标签），不会误告到其他团队的指标 |
+| **目录隔离** | 每个团队独立目录，Git 仓库中分目录管理，提交各自 MR，互不冲突 |
+| **告警路由** | Alertmanager 根据 `severity` + `team` 标签路由到不同通知对象（CI 告警走 infra-alert 邮件，其他团队可走自己的 webhook） |
+| **指标共存** | 所有团队的指标存入同一个 TSDB，不隔离——这通常不是问题，因为查询通过标签区分。如果有保密需求，可以用 Thanos 的租户特性做分租户存储 |
+
+**CI 团队只需关心自己的目录 `infra-ci/`**，其他团队的规则变更由各自维护，定期 `promtool check rules` 通过后 ArgoCD 自动同步。
+
+### 2.5 UX设计
 
 > 设计目标：确保功能不仅"可用"，而且"好用"，降低开发者的认知负担和运维人员的误操作风险。 **不涉及需要说明原因**
 
 **设计说明/归档:** 不涉及。运维人员通过社区自建看板 DataStat（`https://beta.datastat.osinfra.cn/resources?community=infra`）和邮件通知交互。看板直接调用中心 Prometheus HTTP API 获取指标数据并渲染，无需额外 UX 设计。
 
-### 2.5 SOD设计
+### 2.6 SOD设计
 
 > 设计目标：通过维护SOD权限设计文档，确保权限设计可审计、可复用、可跨服务重用。 SOD权限设计参考[XX SOD权限设计.md](XX%20SOD%E6%9D%83%E9%99%90%E8%AE%BE%E8%AE%A1.md)
 >
@@ -199,7 +235,7 @@ EOF
 - 业务集群 `monitoring` 命名空间：仅部署采集器，无需访问中心集群
 - 告警路由由办公软件机器人侧管理（不同集群通知不同运维组），监控系统自身不感知人员分工
 
-### 2.6 功能设计分解TASK清单
+### 2.7 功能设计分解TASK清单
 
 **设计说明/归档:** 基于架构设计，将功能拆解为 8 个 Phase，对应实施计划中的各阶段任务。
 
