@@ -50,7 +50,7 @@ graph TB
     end
 
     CJ -->|1. push 巡检结果| PG
-    CJ -.->|1. 关键巡检直推(冗余)| CPG
+    CJ -.->|1. 关键巡检直推冗余| CPG
     Prom -->|2. TLS 远程拉取| KSM
     Prom -->|2. TLS 远程拉取| NE
     Prom -->|2. TLS 远程拉取| PG
@@ -197,14 +197,14 @@ EOF
 
 | 任务 ID | 功能任务描述 | 责任人 |
 |---------|-------------|--------|
-| **TASK_PH1** | 中心集群搭建：部署 Prometheus HA 对 + Alertmanager Gossip 集群 + Grafana + Pushgateway | [TODO] |
-| **TASK_PH2** | 首个业务集群接入：部署 kube-state-metrics、node-exporter、Pushgateway，打通抓取链路 | [TODO] |
-| **TASK_PH3** | 巡检脚本开发：编写 6 个 CronJob 拨测脚本（GitHub/SA审计/云账号/共享盘/证书/镜像同步） | [TODO] |
-| **TASK_PH4** | 告警规则编写：9 条 PromQL 规则 + Alertmanager 路由配置 + 邮件模板 | [TODO] |
-| **TASK_PH5** | 邮件通知链路：配置 SMTP、端到端测试告警邮件送达 | [TODO] |
-| **TASK_PH6** | 对接办公软件机器人：交付标题格式规范、联调解析与分发 | [TODO] |
-| **TASK_PH7** | 批量接入剩余 9 个业务集群：模板化 YAML + 自动化接入脚本 | [TODO] |
-| **TASK_PH8** | 运维配套：Silence 手册、Pushgateway 陈旧指标清理、值班响应手册 | [TODO] |
+| **TASK_PH1** | 中心集群搭建：部署 Prometheus HA 对 + Alertmanager Gossip 集群 + Grafana + Pushgateway | 张扬 |
+| **TASK_PH2** | 首个业务集群接入：部署 kube-state-metrics、node-exporter、Pushgateway，打通抓取链路 | 张扬 |
+| **TASK_PH3** | 巡检脚本开发：编写 6 个 CronJob 拨测脚本（GitHub/SA审计/云账号/共享盘/证书/镜像同步） | 张扬 |
+| **TASK_PH4** | 告警规则编写：9 条 PromQL 规则 + Alertmanager 路由配置 + 邮件模板 | 张扬 |
+| **TASK_PH5** | 邮件通知链路：配置 SMTP、端到端测试告警邮件送达 | 张扬 |
+| **TASK_PH6** | 对接办公软件机器人：交付标题格式规范、联调解析与分发 | 张扬 |
+| **TASK_PH7** | 批量接入剩余 9 个业务集群：模板化 YAML + 自动化接入脚本 | 张扬 |
+| **TASK_PH8** | 运维配套：Silence 手册、Pushgateway 陈旧指标清理、值班响应手册 | 张扬 |
 
 ---
 
@@ -349,13 +349,13 @@ graph TB
 
 | 任务 ID | 安全任务描述 (Security Tasks) | 责任人 |
 |---------|------------------------------|--------|
-| **SEC-TASK1** | 配置跨集群抓取 TLS/mTLS：为各 exporter 端点签发/配置 TLS 证书，Prometheus 侧配置 `tls_config` | [TODO] |
-| **SEC-TASK2** | 配置 exporter 端点认证：启用 HTTP Basic Auth，凭据存入 Secret | [TODO] |
-| **SEC-TASK3** | Grafana 接入 OIDC 认证，关闭匿名访问，配置默认 Viewer 角色 | [TODO] |
-| **SEC-TASK4** | 创建 SMTP 凭据和云 AK/SK 的 Secret，配置 CronJob 通过 envFrom 引用 | [TODO] |
-| **SEC-TASK5** | 配置 NetworkPolicy：白名单限制 Prometheus 抓取来源 IP 和 Pushgateway 推送来源 | [TODO] |
-| **SEC-TASK6** | 配置容器安全上下文：非 Root 运行、只读文件系统 | [TODO] |
-| **SEC-TASK7** | 部署 cert-manager，配置 exporter 端 TLS 证书自动签发和续期 | [TODO] |
+| **SEC-TASK1** | 配置跨集群抓取 TLS/mTLS：为各 exporter 端点签发/配置 TLS 证书，Prometheus 侧配置 `tls_config` | 张扬 |
+| **SEC-TASK2** | 配置 exporter 端点认证：启用 HTTP Basic Auth，凭据存入 Secret | 张扬 |
+| **SEC-TASK3** | Grafana 接入 OIDC 认证，关闭匿名访问，配置默认 Viewer 角色 | 张扬 |
+| **SEC-TASK4** | 创建 SMTP 凭据和云 AK/SK 的 Secret，配置 CronJob 通过 envFrom 引用 | 张扬 |
+| **SEC-TASK5** | 配置 NetworkPolicy：白名单限制 Prometheus 抓取来源 IP 和 Pushgateway 推送来源 | 张扬 |
+| **SEC-TASK6** | 配置容器安全上下文：非 Root 运行、只读文件系统 | 张扬 |
+| **SEC-TASK7** | 部署 cert-manager，配置 exporter 端 TLS 证书自动签发和续期 | 张扬 |
 
 ### 3.2 可靠性与韧性设计评估和设计
 
@@ -388,10 +388,10 @@ graph TB
 
 | 任务 ID | 可靠性与韧性任务描述 | 责任人 |
 |---------|---------------------|--------|
-| **REL-TASK1** | 配置 Prometheus StatefulSet 反亲和 (`podAntiAffinity`)，确保两个实例分散在不同节点 | [TODO] |
-| **REL-TASK2** | 配置 Alertmanager Gossip 集群健康监控：`alertmanager_cluster_health_score` 告警 | [TODO] |
-| **REL-TASK3** | 部署 Meta-monitoring 拨测器：独立探测 Prometheus / Alertmanager / SMTP 连通性，走非邮件通道通知 | [TODO] |
-| **REL-TASK4** | 配置华为云 EVS 快照策略，定期备份 Prometheus PVC | [TODO] |
+| **REL-TASK1** | 配置 Prometheus StatefulSet 反亲和 (`podAntiAffinity`)，确保两个实例分散在不同节点 | 张扬 |
+| **REL-TASK2** | 配置 Alertmanager Gossip 集群健康监控：`alertmanager_cluster_health_score` 告警 | 张扬 |
+| **REL-TASK3** | 部署 Meta-monitoring 拨测器：独立探测 Prometheus / Alertmanager / SMTP 连通性，走非邮件通道通知 | 张扬 |
+| **REL-TASK4** | 配置华为云 EVS 快照策略，定期备份 Prometheus PVC | 张扬 |
 
 ---
 
@@ -432,10 +432,10 @@ graph TB
 
 | 任务 ID | 可服务性任务描述 | 责任人 |
 |---------|-----------------|--------|
-| **OBS-TASK1** | 部署 Meta-monitoring 拨测 CronJob（独立集群），配置 IM webhook 告警通道 | [TODO] |
-| **OBS-TASK2** | 编写排障手册：包含错误码对照表及对应的排查步骤 | [TODO] |
-| **OBS-TASK3** | 配置 ArgoCD ApplicationSet，实现所有集群采集组件的 GitOps 自动同步 | [TODO] |
-| **OBS-TASK4** | 编写 Silence 操作 SOP：维护前通过 Alertmanager API 创建静默的操作步骤 | [TODO] |
+| **OBS-TASK1** | 部署 Meta-monitoring 拨测 CronJob（独立集群），配置 IM webhook 告警通道 | 张扬 |
+| **OBS-TASK2** | 编写排障手册：包含错误码对照表及对应的排查步骤 | 张扬 |
+| **OBS-TASK3** | 配置 ArgoCD ApplicationSet，实现所有集群采集组件的 GitOps 自动同步 | 张扬 |
+| **OBS-TASK4** | 编写 Silence 操作 SOP：维护前通过 Alertmanager API 创建静默的操作步骤 | 张扬 |
 
 ---
 
@@ -477,8 +477,8 @@ graph TB
 
 | 任务 ID | 性能任务描述 | 责任人 |
 |---------|-------------|--------|
-| **PERF-TASK1** | 配置 Prometheus `metric_relabel_configs` 基数控制规则 | [TODO] |
-| **PERF-TASK2** | 部署 Pushgateway 陈旧指标清理 CronJob（每 30m 清理一次） | [TODO] |
-| **PERF-TASK3** | 编写 Prometheus 资源水位监控看板（内存/CPU/磁盘/active series），Grafana 告警阈值 | [TODO] |
+| **PERF-TASK1** | 配置 Prometheus `metric_relabel_configs` 基数控制规则 | 张扬 |
+| **PERF-TASK2** | 部署 Pushgateway 陈旧指标清理 CronJob（每 30m 清理一次） | 张扬 |
+| **PERF-TASK3** | 编写 Prometheus 资源水位监控看板（内存/CPU/磁盘/active series），Grafana 告警阈值 | 张扬 |
 
 ---
