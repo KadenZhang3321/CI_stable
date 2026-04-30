@@ -26,44 +26,44 @@
 
 ```mermaid
 flowchart TB
-    subgraph center["中心集群 · 监控大脑"]
-        Prom["Prometheus HA 对<br/>(独立抓取, 互为备份)"]
-        AM["Alertmanager Gossip ×2<br/>(去重/分组/抑制)"]
-        GF["Grafana<br/>(看板)"]
-        CPG["中心 Pushgateway<br/>(巡检冗余接收)"]
-    end
-
-    subgraph biz["业务集群 (×10 套)"]
-        KSM["kube-state-metrics<br/>K8s 资源状态"]
-        NE["node-exporter<br/>节点系统指标"]
-        PG["Pushgateway<br/>临时指标暂存"]
-        CJ["CronJob 巡检集 ×6<br/>GitHub/云账号/证书/磁盘/镜像/SA"]
-    end
-
     subgraph notify["通知链路"]
-        SMTP["SMTP 邮件"]
+        direction LR
+        BOT["机器人解析/分发"]
         Mailbox["infra-alert@..."]
-        BOT["办公软件机器人<br/>解析标题/私聊分发"]
+        SMTP["SMTP 邮件服务器"]
     end
 
-    CJ -->|"push 巡检结果"| PG
-    CJ -.->|"关键巡检直推(冗余)"| CPG
-    Prom -->|"TLS 远程拉取"| KSM
-    Prom -->|"TLS 远程拉取"| NE
-    Prom -->|"TLS 远程拉取"| PG
-    Prom -->|"TLS 远程拉取"| CPG
-    Prom -->|"告警推送"| AM
-    Prom -.->|"查询"| GF
-    AM -->|"SMTP 发送"| SMTP
-    SMTP --> Mailbox
-    Mailbox --> BOT
+    subgraph center["中心集群 · 监控大脑"]
+        Prom["Prometheus HA 对"]
+        AM["Alertmanager Gossip ×2"]
+        GF["Grafana 看板"]
+        CPG["Pushgateway"]
+    end
+
+    subgraph biz["业务集群 (×10)"]
+        CJ["CronJob 巡检集 ×6"]
+        PG["Pushgateway"]
+        KSM["kube-state-metrics"]
+        NE["node-exporter"]
+    end
+
+    CJ -->|push| PG
+    CJ -.->|关键巡检直推| CPG
+    Prom -->|TLS 拉取| KSM
+    Prom -->|TLS 拉取| NE
+    Prom -->|TLS 拉取| PG
+    Prom -->|TLS 拉取| CPG
+    Prom -->|告警推送| AM
+    Prom -.->|查询| GF
+    AM -->|SMTP| SMTP
+    SMTP --> Mailbox --> BOT
 ```
 
 **说明：**
-- 三层分离：中心集群（全部告警计算）→ 业务集群（仅采集，不存不告）→ 通知链路（邮件 → 机器人）
-- 业务集群以一套组件为代表（实际 ×10），CronJob 巡检结果 push 到 Pushgateway 后被 Prometheus 拉取；关键巡检项通过虚线直推中心 Pushgateway 冗余
-- 中心 Prometheus HA 对通过 TLS 远程拉取各集群 kube-state-metrics (:8080)、node-exporter (:9100)、Pushgateway (:9091)
-- Alertmanager Gossip 集群负责告警抑制/分组/去重，统一从 SMTP 出口，邮件标题为 `[级别][集群]-告警名称` 结构化格式
+- 上中下三层：通知链路（顶部）← 中心集群（中部）← 业务集群（底部），数据从下往上流
+- 业务集群以一套组件为代表（实际部署 ×10），CronJob 巡检结果 push 到 Pushgateway 后被 Prometheus 拉取
+- 中心 Prometheus HA 对通过 TLS 拉取各集群 :8080 / :9100 / :9091，Alertmanager 负责抑制/分组/去重
+- 关键巡检项通过虚线直推中心 Pushgateway 冗余，绕过集群侧 Pushgateway 单点
 
 ### 2.2 数据流图
 
@@ -232,72 +232,52 @@ EOF
 **威胁建模 — 信任边界图：**
 
 ```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'primaryColor': '#e91e63',
-    'primaryBorderColor': '#c2185b',
-    'primaryTextColor': '#ffffff',
-    'fontSize': '14px'
-  }
-}}%%
-graph TB
-    subgraph "信任边界1: 中心集群 (高信任)"
-        Prom[("Prometheus HA<br/>TSDB 指标数据")]
-        AM[("Alertmanager<br/>告警状态")]
-        GF[("Grafana<br/>看板")]
-        CenterSec[("中心 Secret<br/>SMTP 凭据")]
+flowchart TB
+    subgraph tb1["信任边界 1 · 中心集群 [高信任]"]
+        PromT["Prometheus TSDB"]
+        AMT["Alertmanager"]
+        GFT["Grafana"]
+        SecT["Secret: SMTP凭据"]
     end
 
-    subgraph "信任边界2: 业务集群 (中信任)"
-        KSM[("kube-state-metrics")]
-        NE[("node-exporter")]
-        PG[("Pushgateway")]
-        CJ[("CronJob 巡检")]
-        ClusterSec[("集群 Secret<br/>云 AK/SK")]
+    subgraph tb2["信任边界 2 · 业务集群 [中信任]"]
+        KSMT["kube-state-metrics"]
+        NET["node-exporter"]
+        PGT["Pushgateway"]
+        CJT["CronJob"]
+        SecC["Secret: 云AK/SK"]
     end
 
-    subgraph "信任边界3: 外部服务 (低信任)"
-        GitHub["GitHub API"]
-        CloudAPI["云厂商 BSS API"]
-        SMTP["SMTP 服务器"]
-        Mailbox["企业邮箱"]
-        Bot["办公软件机器人"]
+    subgraph tb3["信任边界 3 · 外部服务 [低信任]"]
+        GitHubT["GitHub API"]
+        CloudT["云BSS API"]
+        SMTPT["SMTP"]
+        MailT["企业邮箱"]
+        BotT["机器人"]
     end
 
-    subgraph "攻击面"
-        Attacker["攻击者"]
-        Leak["指标数据窃听"]
-        Spoof["伪造指标注入"]
-        CredTheft["凭据窃取"]
-    end
+    PromT -->|"跨边界: TLS 抓取"| KSMT
+    PromT -->|"跨边界: TLS 抓取"| NET
+    PromT -->|"跨边界: TLS 抓取"| PGT
+    CJT -->|"跨边界: push"| PGT
+    CJT -.->|"跨边界: 直推"| PromT
+    CJT -->|API 调用| GitHubT
+    CJT -->|API 调用| CloudT
+    AMT -->|"跨边界: SMTP"| SMTPT
+    SMTPT --> MailT --> BotT
+    PromT -->|内部: 告警| AMT
+    GFT -.->|内部: 查询| PromT
 
-    Prom -->|跨信任边界: TLS 抓取| KSM
-    Prom -->|跨信任边界: TLS 抓取| NE
-    Prom -->|跨信任边界: TLS 抓取| PG
-    CJ -->|跨信任边界: push| PG
-    CJ -.->|跨信任边界: 直推| Prom
-    CJ -->|云 API 调用| CloudAPI
-    CJ -->|API 调用| GitHub
-    AM -->|跨信任边界: SMTP 认证| SMTP
-    SMTP --> Mailbox
-    Mailbox -->|IMAP/POP3| Bot
-    Prom -->|告警推送 (内部)| AM
-    GF -.->|查询 (内部)| Prom
-
-    Attacker -.-> Leak
-    Attacker -.-> Spoof
-    Attacker -.-> CredTheft
-    Leak -.->|窃听跨信任边界链路| Prom
-    Spoof -.->|伪造 Pushgateway 数据| PG
-    CredTheft -.->|窃取云 AK/SK| ClusterSec
-    CredTheft -.->|窃取 SMTP 凭据| CenterSec
+    Attacker["攻击者"] -.->|窃听| PromT
+    Attacker -.->|伪造注入| PGT
+    Attacker -.->|窃取凭据| SecT
+    Attacker -.->|窃取凭据| SecC
 ```
 
 **说明：**
-- 三层信任边界：中心集群（完全受控）→ 业务集群（部分受控，多团队共享）→ 外部服务（不受控）
-- 跨越信任边界的数据流是高风险点：Prometheus 跨集群抓取、CronJob 访问云 API、Alertmanager 发送邮件
-- 攻击面聚焦在传输窃听、伪造注入、凭据窃取三类
+- 三层信任边界自上而下信任递减：中心集群（完全受控）→ 业务集群（多团队共享）→ 外部服务（不受控）
+- 跨越边界的数据流标注为高风险点：Prometheus 跨集群抓取（TLS）、CronJob 访问云 API、Alertmanager SMTP 认证
+- 攻击面集中在传输窃听（抓取链路）、伪造注入（Pushgateway）、凭据窃取（Secret）三类
 
 **威胁分析表：**
 
