@@ -5,13 +5,13 @@
 ## 1. 基础信息
 
 * **需求链接**: https://github.com/opensourceways/backlog/issues/294
-* **需求名称**: 开源社区多集群基础设施主动监控体系设计
+* **需求名称**: 开源社区 CI 基础设施多集群主动监控体系设计
 * **开发责任人**: 张扬
 * **设计目标**: 构建跨集群统一可观测性平台，实现以下可量化指标：
 
 | 目标维度 | 量化指标 | 目标值 |
 |---------|---------|--------|
-| 告警覆盖 | 覆盖故障类别数 | ≥ 9 类（GitHub/云账号/证书/磁盘/镜像/SA权限/OOM/Runner/调度积压） |
+| 告警覆盖 | 覆盖故障类别数 | ≥ 9 类（GitHub/云账号/证书/共享盘/镜像同步/SA权限/OOM/Runner/调度积压） |
 | 告警延迟 | 故障发生 → 邮件发出 | ≤ 3 分钟（含 `for` 持续窗口） |
 | 系统可用性 | 中心监控集群年故障时间 | ≤ 8.7 小时/年（99.9%） |
 | 扩展能力 | 支持业务集群数 / 节点数 | ≥ 10 集群 / 500 节点 |
@@ -46,22 +46,19 @@ graph TB
         direction LR
         AM["Alertmanager<br/>Gossip 集群 ×2"]
         Prom["Prometheus HA 对<br/>独立抓取/互为备份"]
-        CPG["中心 Pushgateway<br/>巡检冗余接收"]
+        CPG["Pushgateway<br/>CronJob 巡检指标接收"]
     end
 
     subgraph "业务集群 (×10) · 轻量采集端"
         direction LR
-        CJ["CronJob 巡检集 ×6<br/>GitHub/云账号/证书/磁盘/镜像/SA"]
-        PG["Pushgateway<br/>临时指标暂存"]
+        CJ["CronJob 巡检集 ×6<br/>GitHub/云账号/证书/共享盘/镜像/SA"]
         KSM["kube-state-metrics<br/>K8s 资源状态"]
         NE["node-exporter<br/>节点系统指标"]
     end
 
-    CJ -->|1. push 巡检结果| PG
-    CJ -.->|1. 关键巡检直推冗余| CPG
+    CJ -->|1. push 巡检结果| CPG
     Prom -->|2. TLS 远程拉取| KSM
     Prom -->|2. TLS 远程拉取| NE
-    Prom -->|2. TLS 远程拉取| PG
     Prom -->|2. TLS 远程拉取| CPG
     Prom -->|3. 告警推送| AM
     AM -->|3. SMTP 发送邮件| Mailbox
@@ -71,10 +68,9 @@ graph TB
 
 **说明：**
 - 上中下三层：通知链路（顶部）← 中心集群（中部）← 业务集群（底部），数据从下往上流
-- 业务集群以一套组件为代表（实际部署 ×10），CronJob 巡检结果 push 到 Pushgateway 后被 Prometheus 拉取
-- 中心 Prometheus HA 对通过 TLS 拉取各集群 :8080 / :9100 / :9091，Alertmanager 负责抑制/分组/去重
-- 外部看板 DataStat 通过 Prometheus HTTP API 查询指标数据并渲染仪表盘，独立于告警通路
-- 关键巡检项通过虚线直推中心 Pushgateway 冗余，绕过集群侧 Pushgateway 单点
+- 业务集群以一套组件为代表（实际部署 ×10），CronJob 巡检结果直推中心 Pushgateway，不经过集群侧中转
+- 中心 Prometheus HA 对通过 TLS 拉取各集群 kube-state-metrics (:8080) / node-exporter (:9100) 和中心 Pushgateway (:9091)
+- Alertmanager 负责抑制/分组/去重，统一 SMTP 出口；外部看板 DataStat 通过 Prometheus HTTP API 查询并渲染
 
 ### 2.2 数据流图
 
@@ -93,11 +89,7 @@ graph LR
         Probe["CronJob 巡检<br/>拨测结果"]
     end
 
-    subgraph "2. 指标缓冲"
-        PG["Pushgateway<br/>临时指标暂存"]
-    end
-
-    subgraph "3. 抓取与存储"
+    subgraph "2. 抓取与存储"
         Scrape["Prometheus Scrape<br/>30s-60s 间隔拉取"]
         TSDB["Prometheus TSDB<br/>7-30 天本地存储"]
     end
@@ -115,8 +107,7 @@ graph LR
 
     Node -->|暴露 :9100| Scrape
     K8s -->|暴露 :8080| Scrape
-    Probe -->|push| PG
-    PG -->|暴露 :9091| Scrape
+    Probe -->|push :9091| Scrape
     Scrape --> TSDB
     TSDB --> Rules
     Rules -->|firing alert| AM
@@ -127,7 +118,7 @@ graph LR
 ```
 
 **说明：**
-- 指标采集分两类：长驻指标（node-exporter / kube-state-metrics）由 Prometheus 主动拉取；短生命周期任务（CronJob 巡检）先 push 到 Pushgateway 再被拉取
+- 指标采集分两类：长驻指标（node-exporter / kube-state-metrics）由 Prometheus 主动拉取；短生命周期任务（CronJob 巡检）push 到中心 Pushgateway 后被拉取
 - 告警计算全部在中心 Prometheus 完成，通过 `cluster` 标签区分来源集群
 - Alertmanager 负责抑制（inhibit）、分组（group_by）、路由和重复控制
 - 邮件标题为固定结构化格式 `[级别][集群]-告警名称[-附加标签]`，机器人解析后私聊通知
@@ -145,7 +136,7 @@ graph LR
 | **Prometheus (HA×2)** | 指标抓取、TSDB 存储、告警规则计算 | 各集群 exporter metrics | 告警推送至 Alertmanager | `:9090` (API), scrape 目标端口 |
 | **Alertmanager (Gossip×2)** | 告警分组、抑制、去重、SMTP 路由 | Prometheus alert 推送 | SMTP 邮件 | `:9093` (API), `:9094` (Gossip mesh) |
 | **外部看板 (DataStat)** | 仪表盘可视化、多集群统一查询 | Prometheus HTTP API | 看板渲染 | `https://beta.datastat.osinfra.cn` |
-| **Pushgateway** | 接收 CronJob 临时指标、供 Prometheus 抓取 | CronJob HTTP PUT | Prometheus metrics | `:9091` |
+| **Pushgateway** | 接收各集群 CronJob 巡检指标、供 Prometheus 抓取 | CronJob HTTP PUT | Prometheus metrics | `:9091` |
 
 **业务集群组件（每集群一套）：**
 
@@ -153,8 +144,7 @@ graph LR
 |---------|------|------|------|----------|
 | **kube-state-metrics** | 暴露 K8s 资源对象状态（Pod/Deploy/SA 等） | K8s API | Prometheus metrics | `:8080` |
 | **node-exporter** | 暴露节点系统指标（CPU/内存/磁盘/网络） | /proc, /sys | Prometheus metrics | `:9100` |
-| **Pushgateway** | 接收本集群 CronJob 推送的巡检指标 | CronJob HTTP PUT | Prometheus metrics | `:9091` |
-| **CronJob 巡检集 (×6)** | 周期性执行拨测脚本，结果 push 至 Pushgateway | 外部服务（GitHub/云API/共享盘） | Pushgateway PUT | 脚本 stdout → Pushgateway |
+| **CronJob 巡检集 (×6)** | 周期性执行拨测脚本，结果 push 至中心 Pushgateway | 外部服务（GitHub/云API/共享盘） | Pushgateway PUT | 脚本 stdout → 中心 Pushgateway :9091 |
 
 **关键接口规范：**
 
@@ -266,7 +256,6 @@ graph TB
         direction LR
         KSMT["kube-state-metrics"]
         NET["node-exporter"]
-        PGT["Pushgateway"]
         CJT["CronJob 巡检"]
         SecC["Secret: 云 AK/SK"]
     end
@@ -282,9 +271,7 @@ graph TB
 
     PromT -->|跨边界: TLS 抓取| KSMT
     PromT -->|跨边界: TLS 抓取| NET
-    PromT -->|跨边界: TLS 抓取| PGT
-    CJT -->|跨边界: push| PGT
-    CJT -.->|跨边界: 直推| PromT
+    CJT -->|跨边界: push| PromT
     CJT -->|API 调用| GitHubT
     CJT -->|API 调用| CloudT
     AMT -->|跨边界: SMTP 认证| SMTPT
@@ -296,7 +283,7 @@ graph TB
     Attacker -.-> Spoof
     Attacker -.-> CredTheft
     Leak -.->|窃听抓取链路| PromT
-    Spoof -.->|伪造指标| PGT
+    Spoof -.->|伪造推送指标| PromT
     CredTheft -.->|窃取凭据| SecT
     CredTheft -.->|窃取凭据| SecC
 ```
@@ -314,7 +301,7 @@ graph TB
 | **信息泄露** | SMTP 凭据明文存储在 ConfigMap 中，被未授权访问者读取 | 高 | SMTP 凭据存入 Kubernetes Secret；启用 etcd 静态加密 |
 | **信息泄露** | 外部看板未配置认证，匿名用户可访问所有集群指标面板 | 高 | 看板接入 OAuth2/OIDC 认证，未登录禁止访问；限制数据源 IP 为看板服务器出口 IP |
 | **信息泄露** | 云账号 AK/SK 存储在 CronJob 环境变量中，被 Pod 内其他进程读取 | 高 | AK/SK 存入 Secret 并通过 envFrom 引用；CronJob 容器以非 Root 运行 |
-| **篡改/伪造** | 攻击者向 Pushgateway 推送伪造指标，触发虚假告警或掩盖真实故障 | 中 | Pushgateway 端点配置 HTTP Basic Auth；网络策略限制推送来源 |
+| **篡改/伪造** | 攻击者向中心 Pushgateway 推送伪造指标，触发虚假告警或掩盖真实故障 | 中 | Pushgateway 端点配置 HTTP Basic Auth；网络策略限制推送来源 IP |
 | **篡改/伪造** | 攻击者篡改中心 Prometheus 规则文件，禁用关键告警或注入恶意规则 | 中 | 规则文件通过 GitOps (ArgoCD) 管理，变更需 MR 评审；Prometheus 配置开启只读模式 |
 | **权限提升** | CronJob 使用的云 API AK/SK 权限过大（如 Admin），攻击者可利用其操作云资源 | 中 | 实施最小权限原则：云 AK/SK 仅授予 BSS ReadOnly / SFS ReadOnly |
 | **拒绝服务** | 攻击者向 Pushgateway 大量推送高基数指标，导致 Prometheus 内存耗尽 (OOM) | 中 | Pushgateway 端点限流；Prometheus 配置 `metric_relabel_configs` 过滤高基数标签 |
