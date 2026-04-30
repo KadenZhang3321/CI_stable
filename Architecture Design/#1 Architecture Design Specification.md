@@ -44,7 +44,6 @@ graph TB
 
     subgraph "中心集群 · 监控大脑"
         direction LR
-        GF["Grafana 看板"]
         AM["Alertmanager<br/>Gossip 集群 ×2"]
         Prom["Prometheus HA 对<br/>独立抓取/互为备份"]
         CPG["中心 Pushgateway<br/>巡检冗余接收"]
@@ -65,16 +64,16 @@ graph TB
     Prom -->|2. TLS 远程拉取| PG
     Prom -->|2. TLS 远程拉取| CPG
     Prom -->|3. 告警推送| AM
-    GF -.->|查询| Prom
-    AM -->|4. SMTP 发送邮件| Mailbox
-    Mailbox -->|5. 机器人轮询解析| BOT
-    BOT -->|6. 私聊通知| Staff
+    AM -->|3. SMTP 发送邮件| Mailbox
+    Mailbox -->|4. 机器人轮询解析| BOT
+    BOT -->|5. 私聊通知| Staff
 ```
 
 **说明：**
 - 上中下三层：通知链路（顶部）← 中心集群（中部）← 业务集群（底部），数据从下往上流
 - 业务集群以一套组件为代表（实际部署 ×10），CronJob 巡检结果 push 到 Pushgateway 后被 Prometheus 拉取
 - 中心 Prometheus HA 对通过 TLS 拉取各集群 :8080 / :9100 / :9091，Alertmanager 负责抑制/分组/去重
+- 外部看板 DataStat 通过 Prometheus HTTP API 查询指标数据并渲染仪表盘，独立于告警通路
 - 关键巡检项通过虚线直推中心 Pushgateway 冗余，绕过集群侧 Pushgateway 单点
 
 ### 2.2 数据流图
@@ -145,7 +144,7 @@ graph LR
 |---------|------|------|------|----------|
 | **Prometheus (HA×2)** | 指标抓取、TSDB 存储、告警规则计算 | 各集群 exporter metrics | 告警推送至 Alertmanager | `:9090` (API), scrape 目标端口 |
 | **Alertmanager (Gossip×2)** | 告警分组、抑制、去重、SMTP 路由 | Prometheus alert 推送 | SMTP 邮件 | `:9093` (API), `:9094` (Gossip mesh) |
-| **Grafana** | 仪表盘可视化、多集群统一查询 | Prometheus datasource | 看板渲染 | `:3000` |
+| **外部看板 (DataStat)** | 仪表盘可视化、多集群统一查询 | Prometheus HTTP API | 看板渲染 | `https://beta.datastat.osinfra.cn` |
 | **Pushgateway** | 接收 CronJob 临时指标、供 Prometheus 抓取 | CronJob HTTP PUT | Prometheus metrics | `:9091` |
 
 **业务集群组件（每集群一套）：**
@@ -172,7 +171,19 @@ graph LR
 [{{ .Labels.severity }}][{{ .Labels.cluster }}] {{ .Labels.alertname }}{{ if .Labels.instance }}-instance-{{ .Labels.instance }}{{ end }}
 ```
 
-3. **CronJob 向 Pushgateway 推送格式：**
+3. **Prometheus HTTP API（对外看板查询接口）：**
+
+```bash
+# 即时查询
+GET http://<Prometheus>:9090/api/v1/query?query=github_probe_success{cluster="prod-sh-1"}
+
+# 范围查询（看板画趋势图）
+GET http://<Prometheus>:9090/api/v1/query_range?query=node_memory_MemAvailable_bytes{cluster="prod-sh-1"}&start=2026-04-01T00:00:00Z&end=2026-04-30T00:00:00Z&step=1h
+```
+
+返回标准 JSON，DataStat 看板直接调用此接口获取数据并渲染。
+
+4. **CronJob 向 Pushgateway 推送格式：**
 ```bash
 cat <<EOF | curl --data-binary @- http://pushgateway:9091/metrics/job/cronjob_probe/cluster/${CLUSTER}
 github_probe_success{cluster="${CLUSTER}"} 1
@@ -183,7 +194,7 @@ EOF
 
 > 设计目标：确保功能不仅"可用"，而且"好用"，降低开发者的认知负担和运维人员的误操作风险。 **不涉及需要说明原因**
 
-**设计说明/归档:** 不涉及，本系统为基础设施监控平台，无面向终端用户的 UI 交互。运维人员通过 Grafana 看板（社区标准仪表盘）和邮件通知交互，无需额外 UX 设计。
+**设计说明/归档:** 不涉及。运维人员通过社区自建看板 DataStat（`https://beta.datastat.osinfra.cn/resources?community=infra`）和邮件通知交互。看板直接调用中心 Prometheus HTTP API 获取指标数据并渲染，无需额外 UX 设计。
 
 ### 2.5 SOD设计
 
@@ -206,7 +217,7 @@ EOF
 
 | 任务 ID | 功能任务描述 | 责任人 |
 |---------|-------------|--------|
-| **TASK_PH1** | 中心集群搭建：部署 Prometheus HA 对 + Alertmanager Gossip 集群 + Grafana + Pushgateway | 张扬 |
+| **TASK_PH1** | 中心集群搭建：部署 Prometheus HA 对 + Alertmanager Gossip 集群 + Pushgateway，配置外部看板 DataStat 数据源指向 Prometheus API | 张扬 |
 | **TASK_PH2** | 首个业务集群接入：部署 kube-state-metrics、node-exporter、Pushgateway，打通抓取链路 | 张扬 |
 | **TASK_PH3** | 巡检脚本开发：编写 6 个 CronJob 拨测脚本（GitHub/SA审计/云账号/共享盘/证书/镜像同步） | 张扬 |
 | **TASK_PH4** | 告警规则编写：9 条 PromQL 规则 + Alertmanager 路由配置 + 邮件模板 | 张扬 |
@@ -248,7 +259,6 @@ graph TB
         direction LR
         PromT["Prometheus TSDB"]
         AMT["Alertmanager"]
-        GFT["Grafana 看板"]
         SecT["Secret: SMTP 凭据"]
     end
 
@@ -281,7 +291,6 @@ graph TB
     SMTPT --> MailT
     MailT --> BotT
     PromT -->|内部: 告警推送| AMT
-    GFT -.->|内部: 查询| PromT
 
     Attacker -.-> Leak
     Attacker -.-> Spoof
@@ -303,7 +312,7 @@ graph TB
 |---------|------------------------|---------|--------------------------|
 | **信息泄露** | 跨集群抓取链路未加密，攻击者窃听获取集群指标数据（含 Pod 名、节点 IP 等敏感信息） | 高 | 全链路启用 TLS 1.2+ / mTLS；NetworkPolicy 限制抓取来源 IP |
 | **信息泄露** | SMTP 凭据明文存储在 ConfigMap 中，被未授权访问者读取 | 高 | SMTP 凭据存入 Kubernetes Secret；启用 etcd 静态加密 |
-| **信息泄露** | Grafana 未配置认证，任何人可匿名访问所有集群的指标面板 | 高 | 关闭匿名访问；接入 OAuth2/OIDC；最小化默认角色为 Viewer |
+| **信息泄露** | 外部看板未配置认证，匿名用户可访问所有集群指标面板 | 高 | 看板接入 OAuth2/OIDC 认证，未登录禁止访问；限制数据源 IP 为看板服务器出口 IP |
 | **信息泄露** | 云账号 AK/SK 存储在 CronJob 环境变量中，被 Pod 内其他进程读取 | 高 | AK/SK 存入 Secret 并通过 envFrom 引用；CronJob 容器以非 Root 运行 |
 | **篡改/伪造** | 攻击者向 Pushgateway 推送伪造指标，触发虚假告警或掩盖真实故障 | 中 | Pushgateway 端点配置 HTTP Basic Auth；网络策略限制推送来源 |
 | **篡改/伪造** | 攻击者篡改中心 Prometheus 规则文件，禁用关键告警或注入恶意规则 | 中 | 规则文件通过 GitOps (ArgoCD) 管理，变更需 MR 评审；Prometheus 配置开启只读模式 |
@@ -329,7 +338,7 @@ graph TB
 
 * **身份认证与授权**：
   - 跨集群抓取启用 HTTP Basic Auth 或 Bearer Token（各 exporter 端点配置 `--web.auth.config`）
-  - Grafana 接入 OAuth2/OIDC（GitHub OAuth 或社区 LDAP），关闭匿名访问
+  - 外部看板 DataStat 需接入认证（OAuth2/OIDC），限制 Prometheus API 访问来源 IP
   - Kubernetes RBAC：中心集群 `monitoring` 命名空间仅监控管理员可写；业务集群 `monitoring` 命名空间部署权限最小化
   - NetworkPolicy：中心 Prometheus 抓取来源 IP 白名单，业务集群仅允许中心集群出口 IP
 
@@ -343,7 +352,7 @@ graph TB
   - CronJob 容器以非 Root 用户运行（`securityContext.runAsNonRoot: true`）
   - 容器文件系统设为只读（`readOnlyRootFilesystem: true`），防止二进制篡改
   - Prometheus / Alertmanager 容器限制网络出站（仅允许必要的目标端口）
-  - Grafana 禁止 Server-side Render（SSRF 风险），禁用内嵌 iframe
+  - Prometheus API 仅开放内网访问，不暴露至公网
 
 * **日志审计**：
   - Alertmanager 告警通知日志包含 4W 信息：Who（Alertmanager 实例）、When（firing 时间）、Where（目标集群）、What（alertname + 当前值）
@@ -360,7 +369,7 @@ graph TB
 |---------|------------------------------|--------|
 | **SEC-TASK1** | 配置跨集群抓取 TLS/mTLS：为各 exporter 端点签发/配置 TLS 证书，Prometheus 侧配置 `tls_config` | 张扬 |
 | **SEC-TASK2** | 配置 exporter 端点认证：启用 HTTP Basic Auth，凭据存入 Secret | 张扬 |
-| **SEC-TASK3** | Grafana 接入 OIDC 认证，关闭匿名访问，配置默认 Viewer 角色 | 张扬 |
+| **SEC-TASK3** | 配置外部看板 DataStat 接入 OIDC 认证，限制 Prometheus API 访问来源 IP | 张扬 |
 | **SEC-TASK4** | 创建 SMTP 凭据和云 AK/SK 的 Secret，配置 CronJob 通过 envFrom 引用 | 张扬 |
 | **SEC-TASK5** | 配置 NetworkPolicy：白名单限制 Prometheus 抓取来源 IP 和 Pushgateway 推送来源 | 张扬 |
 | **SEC-TASK6** | 配置容器安全上下文：非 Root 运行、只读文件系统 | 张扬 |
@@ -378,7 +387,7 @@ graph TB
 
 - **Prometheus HA 对：** 两个独立实例抓取相同目标，各自保留完整 TSDB。单实例宕机不影响告警计算和通知。
 - **Alertmanager Gossip 集群 (×2)：** 共享告警状态（silence / inhibition / 已发送通知），单实例宕机不丢告警、不重复发送。
-- **Grafana 降级为单实例：** 看板不可用时不影响告警通路，通过 PVC 持久化仪表盘配置，重建后可恢复。
+- **外部看板 (DataStat) 独立于监控集群：** 看板不可用时不影响告警通路，告警仍通过 SMTP 正常发送。
 - **业务集群采集器单实例：** 采集器故障仅影响本集群（且关键 CronJob 直推中心 Pushgateway 冗余）。
 
 **降级策略：**
@@ -488,6 +497,6 @@ graph TB
 |---------|-------------|--------|
 | **PERF-TASK1** | 配置 Prometheus `metric_relabel_configs` 基数控制规则 | 张扬 |
 | **PERF-TASK2** | 部署 Pushgateway 陈旧指标清理 CronJob（每 30m 清理一次） | 张扬 |
-| **PERF-TASK3** | 编写 Prometheus 资源水位监控看板（内存/CPU/磁盘/active series），Grafana 告警阈值 | 张扬 |
+| **PERF-TASK3** | 编写 Prometheus 资源水位监控看板（内存/CPU/磁盘/active series），在 DataStat 中配置告警阈值面板 | 张扬 |
 
 ---
