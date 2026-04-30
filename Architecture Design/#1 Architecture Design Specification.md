@@ -25,78 +25,45 @@
 **系统架构拓扑图：**
 
 ```mermaid
-%%{init: {
-  'theme': 'base',
-  'themeVariables': {
-    'primaryColor': '#9c27b0',
-    'primaryBorderColor': '#6a1b9a',
-    'primaryTextColor': '#ffffff',
-    'secondaryColor': '#2196f3',
-    'tertiaryColor': '#4caf50',
-    'fontSize': '13px'
-  }
-}}%%
-graph TB
-    subgraph center["━━━ 中心集群 : 监控大脑 ━━━"]
-        direction LR
-        Prom1["Prom-1"]
-        Prom2["Prom-2"]
-        AM1["AM-1"]
-        AM2["AM-2"]
-        Grafana["Grafana"]
-        CenterPG["Pushgateway"]
-        Prom1 & Prom2 --> AM1 & AM2
-        AM1 <-->|Gossip| AM2
-        Prom1 & Prom2 -.-> Grafana
+flowchart TB
+    subgraph center["中心集群 · 监控大脑"]
+        Prom["Prometheus HA 对<br/>(独立抓取, 互为备份)"]
+        AM["Alertmanager Gossip ×2<br/>(去重/分组/抑制)"]
+        GF["Grafana<br/>(看板)"]
+        CPG["中心 Pushgateway<br/>(巡检冗余接收)"]
     end
 
-    subgraph cluster["━━━ 业务集群 (×10) : 轻量采集端 ━━━"]
-        direction TB
-        subgraph cA["集群 A"]
-            direction LR
-            KSM_A["kube-state-metrics"]
-            NE_A["node-exporter"]
-            PG_A["Pushgateway"]
-            CJ_A["CronJob"]
-            CJ_A --> PG_A
-        end
-        subgraph cB["集群 B"]
-            direction LR
-            KSM_B["kube-state-metrics"]
-            NE_B["node-exporter"]
-            PG_B["Pushgateway"]
-            CJ_B["CronJob"]
-            CJ_B --> PG_B
-        end
-        subgraph cN["集群 N ..."]
-            direction LR
-            KSM_N["kube-state-metrics"]
-            NE_N["node-exporter"]
-            PG_N["Pushgateway"]
-            CJ_N["CronJob"]
-            CJ_N --> PG_N
-        end
+    subgraph biz["业务集群 (×10 套)"]
+        KSM["kube-state-metrics<br/>K8s 资源状态"]
+        NE["node-exporter<br/>节点系统指标"]
+        PG["Pushgateway<br/>临时指标暂存"]
+        CJ["CronJob 巡检集 ×6<br/>GitHub/云账号/证书/磁盘/镜像/SA"]
     end
 
-    subgraph notify["━━━ 通知链路 ━━━"]
-        direction LR
-        SMTP["SMTP 服务器"]
+    subgraph notify["通知链路"]
+        SMTP["SMTP 邮件"]
         Mailbox["infra-alert@..."]
-        Bot["办公软件机器人"]
-        Staff["运维人员"]
-        SMTP --> Mailbox --> Bot --> Staff
+        BOT["办公软件机器人<br/>解析标题/私聊分发"]
     end
 
-    center -->|"远程拉取指标 (HTTPS/TLS)"| cluster
-    CJ_A & CJ_B & CJ_N -.->|关键巡检直推| CenterPG
-    AM1 & AM2 -->|SMTP 发送邮件| SMTP
+    CJ -->|"push 巡检结果"| PG
+    CJ -.->|"关键巡检直推(冗余)"| CPG
+    Prom -->|"TLS 远程拉取"| KSM
+    Prom -->|"TLS 远程拉取"| NE
+    Prom -->|"TLS 远程拉取"| PG
+    Prom -->|"TLS 远程拉取"| CPG
+    Prom -->|"告警推送"| AM
+    Prom -.->|"查询"| GF
+    AM -->|"SMTP 发送"| SMTP
+    SMTP --> Mailbox
+    Mailbox --> BOT
 ```
 
 **说明：**
-- 三层垂直结构：中心集群（监控大脑）→ 业务集群（采集端）→ 通知链路，数据自下而上汇聚
-- 业务集群内：CronJob 巡检脚本 push 到本集群 Pushgateway；关键巡检项通过虚线直推中心 Pushgateway 冗余
-- 中心 Prometheus HA 对通过 TLS 远程拉取各集群 exporter 端点（kube-state-metrics :8080, node-exporter :9100, Pushgateway :9091）
-- Alertmanager Gossip 集群去重后统一通过 SMTP 发送结构化标题邮件到唯一邮箱，办公软件机器人轮询解析后私聊通知
+- 三层分离：中心集群（全部告警计算）→ 业务集群（仅采集，不存不告）→ 通知链路（邮件 → 机器人）
+- 业务集群以一套组件为代表（实际 ×10），CronJob 巡检结果 push 到 Pushgateway 后被 Prometheus 拉取；关键巡检项通过虚线直推中心 Pushgateway 冗余
+- 中心 Prometheus HA 对通过 TLS 远程拉取各集群 kube-state-metrics (:8080)、node-exporter (:9100)、Pushgateway (:9091)
+- Alertmanager Gossip 集群负责告警抑制/分组/去重，统一从 SMTP 出口，邮件标题为 `[级别][集群]-告警名称` 结构化格式
 
 ### 2.2 数据流图
 
