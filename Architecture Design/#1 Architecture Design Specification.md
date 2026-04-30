@@ -33,94 +33,70 @@
     'primaryTextColor': '#ffffff',
     'secondaryColor': '#2196f3',
     'tertiaryColor': '#4caf50',
-    'fontSize': '14px'
+    'fontSize': '13px'
   }
 }}%%
 graph TB
-    subgraph "中心集群 - 监控大脑"
-        Prom1["Prometheus-1<br/>HA 实例"]
-        Prom2["Prometheus-2<br/>HA 实例"]
-        AM1["Alertmanager-1<br/>Gossip 集群"]
-        AM2["Alertmanager-2<br/>Gossip 集群"]
-        Grafana["Grafana<br/>可视化看板"]
-        CenterPG["Pushgateway<br/>关键巡检冗余接收"]
+    subgraph center["━━━ 中心集群 : 监控大脑 ━━━"]
+        direction LR
+        Prom1["Prom-1"]
+        Prom2["Prom-2"]
+        AM1["AM-1"]
+        AM2["AM-2"]
+        Grafana["Grafana"]
+        CenterPG["Pushgateway"]
+        Prom1 & Prom2 --> AM1 & AM2
+        AM1 <-->|Gossip| AM2
+        Prom1 & Prom2 -.-> Grafana
     end
 
-    subgraph "业务集群 A - 采集端"
-        PG_A["Pushgateway"]
-        KSM_A["kube-state-metrics"]
-        NE_A["node-exporter<br/>DaemonSet"]
-        CJ_A["CronJob 巡检集<br/>6 个定时任务"]
+    subgraph cluster["━━━ 业务集群 (×10) : 轻量采集端 ━━━"]
+        direction TB
+        subgraph cA["集群 A"]
+            direction LR
+            KSM_A["kube-state-metrics"]
+            NE_A["node-exporter"]
+            PG_A["Pushgateway"]
+            CJ_A["CronJob"]
+            CJ_A --> PG_A
+        end
+        subgraph cB["集群 B"]
+            direction LR
+            KSM_B["kube-state-metrics"]
+            NE_B["node-exporter"]
+            PG_B["Pushgateway"]
+            CJ_B["CronJob"]
+            CJ_B --> PG_B
+        end
+        subgraph cN["集群 N ..."]
+            direction LR
+            KSM_N["kube-state-metrics"]
+            NE_N["node-exporter"]
+            PG_N["Pushgateway"]
+            CJ_N["CronJob"]
+            CJ_N --> PG_N
+        end
     end
 
-    subgraph "业务集群 B"
-        PG_B["Pushgateway"]
-        KSM_B["kube-state-metrics"]
-        NE_B["node-exporter<br/>DaemonSet"]
-        CJ_B["CronJob 巡检集<br/>6 个定时任务"]
-    end
-
-    subgraph "业务集群 N..."
-        PG_N["Pushgateway"]
-        KSM_N["kube-state-metrics"]
-        NE_N["node-exporter<br/>DaemonSet"]
-        CJ_N["CronJob 巡检集<br/>6 个定时任务"]
-    end
-
-    subgraph "通知链路"
-        SMTP["SMTP 邮件服务器"]
-        Mailbox["infra-alert@community.org"]
+    subgraph notify["━━━ 通知链路 ━━━"]
+        direction LR
+        SMTP["SMTP 服务器"]
+        Mailbox["infra-alert@..."]
         Bot["办公软件机器人"]
         Staff["运维人员"]
+        SMTP --> Mailbox --> Bot --> Staff
     end
 
-    Prom1 -->|拉取指标| KSM_A
-    Prom2 -->|拉取指标| KSM_A
-    Prom1 -->|拉取指标| NE_A
-    Prom2 -->|拉取指标| NE_A
-    Prom1 -->|拉取指标| PG_A
-    Prom2 -->|拉取指标| PG_A
-    Prom1 -->|拉取指标| KSM_B
-    Prom2 -->|拉取指标| KSM_B
-    Prom1 -->|拉取指标| NE_B
-    Prom2 -->|拉取指标| NE_B
-    Prom1 -->|拉取指标| PG_B
-    Prom2 -->|拉取指标| PG_B
-    Prom1 -->|拉取指标| KSM_N
-    Prom2 -->|拉取指标| KSM_N
-    Prom1 -->|拉取指标| NE_N
-    Prom2 -->|拉取指标| NE_N
-    Prom1 -->|拉取指标| PG_N
-    Prom2 -->|拉取指标| PG_N
-
-    CJ_A -->|push 指标| PG_A
-    CJ_B -->|push 指标| PG_B
-    CJ_N -->|push 指标| PG_N
-    CJ_A -.->|关键巡检直推| CenterPG
-    CJ_B -.->|关键巡检直推| CenterPG
-    CJ_N -.->|关键巡检直推| CenterPG
-    Prom1 -->|拉取指标| CenterPG
-    Prom2 -->|拉取指标| CenterPG
-
-    Prom1 -->|发送告警| AM1
-    Prom2 -->|发送告警| AM2
-    AM1 <-->|Gossip mesh| AM2
-    Prom1 -.->|查询| Grafana
-    Prom2 -.->|查询| Grafana
-
-    AM1 -->|SMTP| SMTP
-    AM2 -->|SMTP| SMTP
-    SMTP --> Mailbox
-    Mailbox -->|机器人轮询| Bot
-    Bot -->|解析标题私聊| Staff
+    center -->|"远程拉取指标 (HTTPS/TLS)"| cluster
+    CJ_A & CJ_B & CJ_N -.->|关键巡检直推| CenterPG
+    AM1 & AM2 -->|SMTP 发送邮件| SMTP
 ```
 
 **说明：**
-- 中心集群 Prometheus 采用 HA 对模式（两个独立实例抓取相同目标），Alertmanager 组成 Gossip 集群防重复发送
-- 业务集群仅运行轻量采集器，不部署独立 Prometheus/Alertmanager，降低维护成本
-- 实线箭头：Prometheus 远程拉取（pull）各集群 exporter 端点
-- 虚线箭头：CronJob 关键巡检项直推中心 Pushgateway（绕过集群侧单点）
-- 通知链路：Alertmanager → SMTP → 企业邮箱 → 机器人轮询 → 解析私聊，告警路由逻辑从监控系统剥离
+- 三层垂直结构：中心集群（监控大脑）→ 业务集群（采集端）→ 通知链路，数据自下而上汇聚
+- 业务集群内：CronJob 巡检脚本 push 到本集群 Pushgateway；关键巡检项通过虚线直推中心 Pushgateway 冗余
+- 中心 Prometheus HA 对通过 TLS 远程拉取各集群 exporter 端点（kube-state-metrics :8080, node-exporter :9100, Pushgateway :9091）
+- Alertmanager Gossip 集群去重后统一通过 SMTP 发送结构化标题邮件到唯一邮箱，办公软件机器人轮询解析后私聊通知
 
 ### 2.2 数据流图
 
@@ -233,85 +209,13 @@ github_probe_success{cluster="${CLUSTER}"} 1
 EOF
 ```
 
-### 2.4 告警规则管理模型
-
-> 设计目标：在统一集中告警的基础上，允许不同业务集群按需定制额外规则，兼顾一致性和灵活性。
-
-**设计说明/归档:** 采用"通用规则集中维护 + 集群定制规则分散提交"的混合模型。通用规则由监控团队统一管理，集群定制规则由各业务团队自主提交、监控团队 review 后合入。
-
-**规则目录结构：**
-
-```
-中心 Prometheus 规则加载路径: /etc/prometheus/rules/
-
-rules/
-├── common/                    ← 监控团队维护，全体集群生效
-│   ├── infra.yaml             ← GitHub/云账号/证书等 9 条通用巡检告警
-│   └── k8s-health.yaml        ← Runner/DaemonSet/Pending Pod 等 K8s 健康告警
-│
-└── clusters/                  ← 各业务团队自助提交（可选）
-    ├── prod-sh-1.yaml         ← 集群 A 的定制规则
-    ├── staging.yaml           ← 集群 B 的定制规则
-    └── README.md              ← 提交规范说明
-```
-
-**Prometheus 加载配置：**
-
-```yaml
-rule_files:
-  - /etc/prometheus/rules/common/*.yaml
-  - /etc/prometheus/rules/clusters/*.yaml
-```
-
-**业务团队提交定制规则流程：**
-
-1. 业务团队在 Git 仓库中创建 `rules/clusters/<cluster-name>.yaml`
-2. 所有定制规则必须限定 `cluster` 标签，例如：
-
-```yaml
-groups:
-  - name: prod-sh-1-custom
-    rules:
-      - alert: CustomAppErrorRate
-        expr: |
-          rate(http_requests_total{cluster="prod-sh-1", status=~"5.."}[5m]) > 0.1
-        for: 5m
-        labels:
-          severity: WARNING
-          cluster: prod-sh-1
-        annotations:
-          summary: "集群 prod-sh-1 自定义应用错误率超标"
-```
-
-3. 提交 MR，监控团队 review 以下事项后合入：
-   - 规则是否通过 `promtool check rules` 语法校验
-   - 是否限定 `cluster` 标签（未限定的拒绝合入，防止误报到其他集群）
-   - 指标是否存在（需对应集群已暴露该指标）
-   - 告警级别和名称不与通用规则冲突
-
-4. ArgoCD 检测到 Git 变更后自动 reload Prometheus
-
-**两条硬约束：**
-
-| 约束 | 说明 |
-|------|------|
-| **必须限定 cluster** | 每条定制规则的 `expr` 必须包含 `cluster="<集群名>"`，review 时重点检查，违反此条直接拒绝 |
-| **不走动态加载** | Prometheus 不支持动态加载规则文件。规则变更通过 Git → ArgoCD → reload 路径，有审计记录可回滚 |
-
-**通用规则 vs 定制规则的归属：**
-
-| 规则类型 | 维护者 | 生效范围 | 示例 |
-|---------|--------|---------|------|
-| 通用规则 | 监控团队 | 所有集群 | GithubUnreachable, CloudAccountFrozen, RunnerDown |
-| 集群定制 | 业务团队提交，监控团队 review | 仅指定集群 | 某集群特有的应用错误率、业务指标异常 |
-
-### 2.5 UX设计
+### 2.4 UX设计
 
 > 设计目标：确保功能不仅"可用"，而且"好用"，降低开发者的认知负担和运维人员的误操作风险。 **不涉及需要说明原因**
 
 **设计说明/归档:** 不涉及，本系统为基础设施监控平台，无面向终端用户的 UI 交互。运维人员通过 Grafana 看板（社区标准仪表盘）和邮件通知交互，无需额外 UX 设计。
 
-### 2.6 SOD设计
+### 2.5 SOD设计
 
 > 设计目标：通过维护SOD权限设计文档，确保权限设计可审计、可复用、可跨服务重用。 SOD权限设计参考[XX SOD权限设计.md](XX%20SOD%E6%9D%83%E9%99%90%E8%AE%BE%E8%AE%A1.md)
 >
@@ -324,7 +228,7 @@ groups:
 - 业务集群 `monitoring` 命名空间：仅部署采集器，无需访问中心集群
 - 告警路由由办公软件机器人侧管理（不同集群通知不同运维组），监控系统自身不感知人员分工
 
-### 2.7 功能设计分解TASK清单
+### 2.6 功能设计分解TASK清单
 
 **设计说明/归档:** 基于架构设计，将功能拆解为 8 个 Phase，对应实施计划中的各阶段任务。
 
