@@ -1,288 +1,519 @@
-# 开源社区多集群基础设施主动监控体系设计
-
-**文档版本：** v3.1
-
-**适用范围：** 多个 Kubernetes 集群环境下的 CI/CD 基础设施健康监控与告警
-
-**目标：** 构建跨集群的统一可观测性平台，主动发现组件、网络、存储、云资源故障，按严重级别生成结构化邮件通知，交由办公软件机器人解析并分发给对应责任人。
+# #294 CI 基础设施多集群主动监控体系 架构设计说明书 (Architecture Design Document)
 
 ---
 
-## 一、设计目标与原则
+## 1. 基础信息
 
-- **集中式指标采集与告警计算：** 所有集群的健康指标汇聚到一个中心 Prometheus，由中心统一计算告警，避免在每个集群维护独立的告警规则和通知渠道。
-- **轻量级集群侧部署：** 每个业务集群仅运行采集器（kube-state-metrics、node-exporter、Pushgateway、CronJob），不独立部署 Prometheus 和 Alertmanager，降低维护成本。
-- **统一邮件出口：** 所有告警仅通过 Alertmanager 发送到唯一的企业邮箱地址，不在系统中配置多种通知渠道。告警的分发由外部办公软件机器人完成。
-- **结构化邮件标题：** 邮件标题包含严重级别、集群标识、告警名称等字段，固定格式，保证机器人可准确解析并私聊到对应运维人员。
-- **主动巡检：** 对已知问题实施周期性拨测，在用户可感知之前主动发现异常，将运维模式从被动响应转变为主动探知。
+* **需求链接**: https://github.com/opensourceways/backlog/issues/294
+* **需求名称**: 开源社区 CI 基础设施多集群主动监控体系设计
+* **开发责任人**: 张扬
+* **设计目标**: 构建跨集群统一可观测性平台，实现以下可量化指标：
 
----
+| 目标维度 | 量化指标 | 目标值 |
+|---------|---------|--------|
+| 告警覆盖 | 覆盖故障类别数 | ≥ 9 类（GitHub/云账号/证书/共享盘/镜像同步/SA权限/OOM/Runner/调度积压） |
+| 告警延迟 | 故障发生 → 邮件发出 | ≤ 6 分钟（含 `for` 持续窗口） |
+| 系统可用性 | 中心监控集群年故障时间 | ≤ 8.7 小时/年（99.9%） |
+| 扩展能力 | 支持业务集群数 / 节点数（扩展上限） | ≥ 10 集群 / 500 节点 |
+| 接入效率 | 新集群接入耗时 | ≤ 0.5 人天/集群 |
+| 通知可达 | 告警邮件到达率 | ≥ 99%（SMTP 发送成功/总量） |
 
-## 二、总体架构
+> **告警延迟说明**：目标值 ≤ 6 分钟基于以下链路估算：scrape interval 60s（最坏 60s）→ `for: 2m`（120s）→ Alertmanager `group_wait: 10s` / `group_interval: 30s` → SMTP 投递（~10s）→ 机器人轮询（30s），合计约 4-5 分钟，预留 1 分钟 buffer。关键调优参数：
+> - `group_wait` 从默认 30s 缩短为 **10s**（减少首次告警等待）
+> - `group_interval` 保持 **30s**（避免邮件风暴，同组后续告警不额外等待）
+> - 如需进一步缩短，可将 `for` 改为 1m + scrape interval 改为 30s（仅对关键告警），但会增加误报风险
 
-```
-                                  ┌──────────────────────────┐
-                                  │         中心集群          │
-                                  │                          │
-                                  │  ┌──────────┐┌──────────┐│
-                                  │  │ Prom-1   ││ Prom-2   ││
-                                  │  │ (HA 对)  ││          ││
-                                  │  └────┬─────┘└────┬─────┘│
-                                  │       └─────┬──────┘      │
-                                  │             │             │
-                                  │   ┌─────────▼──────────┐  │
-                                  │   │ Alertmanager       │  │
-                                  │   │ (Gossip 集群 ×2)    │  │
-                                  │   └─────────┬──────────┘  │
-                                  │             │             │
-                                  │   ┌─────────▼──────────┐  │
-                                  │   │ Grafana (单实例)   │  │
-                                  │   └────────────────────┘  │
-                                  │                          │
-                                  │   ┌────────────────────┐  │
-                                  │   │ Pushgateway (可选) │◄─┼──┐
-                                  │   └────────────────────┘  │  │
-                                  └─────────────┬────────────┘  │
-                                                │               │
-          ┌─────────────────────────────────────┼───────────────┼──┐
-          │                                     │               │  │
-  ┌───────▼────────┐              ┌────────────▼──┐            │  │
-  │    集群 A       │              │    集群 B       │     ...   │  │
-  │                │              │                │            │  │
-  │ ┌────────────┐ │              │ ┌────────────┐ │            │  │
-  │ │Pushgateway │◄├──┐           │ │Pushgateway │◄├──┐         │  │
-  │ └────────────┘ │  │           │ └────────────┘ │  │         │  │
-  │                │  │           │                │  │         │  │
-  │ ┌────────────┐ │  │           │ ┌────────────┐ │  │         │  │
-  │ │kube-state- │ │  │           │ │kube-state- │ │  │         │  │
-  │ │  metrics   │ │  │           │ │  metrics   │ │  │         │  │
-  │ └────────────┘ │  │           │ └────────────┘ │  │         │  │
-  │                │  │           │                │  │         │  │
-  │ ┌────────────┐ │  │           │ ┌────────────┐ │  │         │  │
-  │ │   node-    │ │  │           │ │   node-    │ │  │         │  │
-  │ │  exporter  │ │  │           │ │  exporter  │ │  │         │  │
-  │ └────────────┘ │  │           │ └────────────┘ │  │         │  │
-  │                │  │           │                │  │         │  │
-  │ ┌────────────┐ │  │           │ ┌────────────┐ │  │         │  │
-  │ │CronJob     ├──┘  │           │ │CronJob     ├──┘  │         │  │
-  │ │ 巡检集     ├───┐ │           │ │ 巡检集     ├───┐ │         │  │
-  │ └────────────┘   │ │           │ └────────────┘   │ │         │  │
-  └───────────────────┼─┘           └──────────────────┼─┘         │  │
-                      └────────────────────────────────┘            │  │
-                       CronJob 关键巡检 ─ ─ ─虚线: 直推中心 Pushgateway  │  │
-                       (绕过集群侧，避免单点)                            │  │
+### 1.1 问题与根因
 
-  中心 Prometheus ──远程拉取──► 各集群 Pushgateway / kube-state-metrics / node-exporter
+CI 基础设施在多集群环境下长期存在以下 9 类问题，均依赖人工发现，缺乏主动监控机制。
 
-  Alertmanager ──SMTP──► infra-alert@community.org ──机器人轮询──► 办公软件机器人 ──解析标题私聊──► 运维人员
-```
+| 编号 | 问题 | 根因 | 对 CI 的影响 |
+|------|------|------|------------|
+| 1 | **GitHub 不可达** | 网络策略变更、代理故障、GitHub 服务降级 | CI 全面停摆，用户无感知直到提交超时 |
+| 2 | **ServiceAccount 权限过大** | CI 模板中 SA 配置未收敛，历史遗留大权限 | 安全合规风险，横向移动入口 |
+| 3 | **云账号欠费/冻结** | 资源消耗超预算、财务流程延迟 | 整个集群不可用，恢复耗时长 |
+| 4 | **共享盘使用率过高** | 构建产物未定期清理、日志膨胀 | Runner 被驱逐，所有 Pipeline 失败 |
+| 5 | **代理证书过期 / 代理宕机** | 证书未设到期提醒、代理单点无冗余 | 多集群通信中断，跨区域构建失败 |
+| 6 | **代码仓镜像同步失败** | 镜像同步任务失败无人关注、网络抖动 | 构建用旧代码或拉取失败 |
+| 7 | **Pod OOM 用户无感知** | CI 模板未配置 OOM 自动评论通知 | 用户反复重试无效，排查耗时长 |
+| 8 | **Runner 副本不可用** | HPA 误缩容、节点资源不足、镜像拉取失败 | CI 完全不可用，无任何主动通知 |
+| 9 | **调度积压** | 集群资源规划不足、某些节点被大作业独占 | CI 响应延迟飙升，用户体验下降 |
 
-> **注：** 上图为逻辑架构。Prometheus HA、Alertmanager Gossip 集群、中心 Pushgateway 的物理部署方案详见 [2.1 节](#21-中心集群高可用) 和 [4.4 节](#44-跨集群网络与安全)。
+**共性根因**：所有问题都存在"故障已发生但运维团队不知道"的时间差。问题 1-6 属于**环境依赖型故障**（外部服务或基础设施异常），问题 7-9 属于**集群内生故障**（K8s 资源状态异常）。前者的难点在于拨测频率和覆盖度，后者的难点在于 kube-state-metrics 指标已有但缺乏告警规则。
 
-### 架构要点说明
-
-| 组件 | 说明 |
-|------|------|
-| **中心集群** | 承担全部告警计算与分发，部署 Prometheus、Alertmanager、Grafana，是监控大脑。 |
-| **业务集群** | 仅部署轻量级采集器，无状态，可快速复制到新集群。 |
-| **通知链路** | Alertmanager → SMTP → 企业邮箱 → 机器人轮询解析 → 私聊通知。该设计将告警路由逻辑从监控系统剥离，交给办公软件侧灵活管理。 |
-
-### 2.1 中心集群高可用
-
-中心集群是监控大脑，宕机会导致所有集群告警中断。最低限度应保障：
-
-- **Prometheus HA：** 部署两个相同配置的 Prometheus 实例独立抓取，互为备份。后续可引入 Thanos Sidecar + 对象存储实现长期保留与全局查询去重。
-- **Alertmanager 集群：** 至少部署 2 个实例组成 Gossip 集群，共享告警状态，避免单实例宕机时丢失告警或重复发送。
-- **Grafana：** 可降级为单实例（故障时不影响告警通路），使用 PVC 持久化仪表盘配置。
+**本架构的核心解决思路**：对环境依赖型故障（1-6）使用 CronJob 周期性拨测 + Pushgateway 推送指标，对集群内生故障（7-9）直接使用 kube-state-metrics 原生指标，两者在中心 Prometheus 统一计算告警。
 
 ---
 
-## 三、邮件通知设计
+## 2. 功能设计
 
-### 3.1 唯一收件地址
+> **说明**：描述系统的组件构成、职责划分及交互逻辑。
 
-所有告警均发送至：`infra-alert@community.org`（示例地址，具体由社区确定）。
+### 2.1 架构图
 
-该邮箱由办公软件机器人专用，不与其他邮箱混合使用。
+> 此处建议插入架构拓扑系统组件图或时序图，描述组件间的交互关系。推荐使用Mermaid实现，可代码化，GitHub可渲染。
+> **不涉及需要说明原因**
 
-### 3.2 邮件标题格式
+**设计说明/归档:** 本架构图展示了集中式监控体系的逻辑拓扑：中心集群（监控大脑）与业务集群（轻量采集端）的组件关系、数据流向及通知链路。
 
-标题采用固定结构，方便机器人解析：
+**系统架构拓扑图：**
 
-```
-[级别][集群]-告警名称[-附加标签]
-```
+```mermaid
+graph TB
+    subgraph "通知链路"
+        direction LR
+        Staff["运维人员"]
+        BOT["办公软件机器人<br/>解析标题/私聊分发"]
+        Mailbox["infra-alert@...<br/>企业邮箱"]
+    end
 
-| 字段 | 说明 |
-|------|------|
-| **级别** | `CRITICAL`、`WARNING`、`INFO` |
-| **集群** | 业务集群的唯一标识，如 `prod-sh-1`、`staging` 等 |
-| **告警名称** | Prometheus 告警规则中定义的 `alertname` |
-| **附加标签**（可选） | 如涉及特定实例、命名空间时，追加用 `-` 连接的键值对 |
+    subgraph "中心集群 · 监控大脑"
+        direction LR
+        AM["Alertmanager Gossip 集群 (×2)"]
+        Prom["Prometheus HA 对<br/>独立抓取/互为备份"]
+        CPG["Pushgateway<br/>CronJob 巡检指标接收"]
+    end
 
-**示例：**
+    subgraph "业务集群 (当前 ×10) · 轻量采集端"
+        direction LR
+        CJ["CronJob 巡检集 ×6<br/>GitHub/云账号/证书/共享盘/镜像/SA"]
+        KSM["kube-state-metrics<br/>K8s 资源状态"]
+        NE["node-exporter<br/>节点系统指标"]
+    end
 
-- `[CRITICAL][prod-sh-1] GithubUnreachable`
-- `[WARNING][prod-sh-1] SharedDiskSpaceHigh-instance-shared`
-- `[CRITICAL][staging] RunnerDown-deployment-runner`
-- `[INFO][prod-sh-1] RecentOOMKilled-namespace-ci`
-
-### 3.3 邮件正文
-
-正文包含：
-
-- 告警摘要（annotations 中的 `summary`）
-- 详细描述（annotations 中的 `description`）
-- 发生时间、当前值
-- 附加标签列表，便于机器人二次路由
-
-### 3.4 机器人路由逻辑（由办公软件侧实现）
-
-机器人从邮箱拉取未读邮件，解析标题中的：
-
-| 解析字段 | 用途 |
-|---------|------|
-| **级别** | 决定私聊的紧急程度和是否追加提醒 |
-| **集群** | 决定通知哪一组运维人员（不同集群可能由不同人负责） |
-| **告警名称** | 决定更精细的指派策略（例如存储类告警通知存储管理员） |
-
-> 该部分逻辑不在本文档范围内，由办公软件机器人开发团队依据标题格式实现。
-
----
-
-## 四、多集群指标采集设计
-
-### 4.1 集群标识
-
-每个业务集群必须拥有全局唯一的 `cluster` 标签，并注入到所有指标中：
-
-- 采集组件（kube-state-metrics、node-exporter）通过外部标签注入。
-- CronJob 在推送到 Pushgateway 时显式附加 `cluster` 标签。
-- 中心 Prometheus 在抓取配置中为各集群 job 添加静态 `cluster` 标签，作为兜底。
-
-### 4.2 采集端组件
-
-每个业务集群需部署：
-
-| 组件 | 用途 |
-|------|------|
-| **kube-state-metrics** | K8s 资源对象状态指标 |
-| **node-exporter** | 节点系统指标（CPU、内存、磁盘、网络） |
-| **Pushgateway** | 接收 CronJob 推送的临时指标 |
-| **CronJob 巡检集** | 周期性执行拨测脚本，结果推送至本地 Pushgateway |
-
-所有组件在同一 `monitoring` 命名空间下运行，统一管理。
-
-### 4.3 中心 Prometheus 抓取
-
-中心 Prometheus 通过添加 scrape job 拉取各集群端点。需保证网络可达（专线、VPN、LoadBalancer 暴露等）。在 job 配置中附加 `cluster` 标签，用于告警路由。
-
-### 4.4 跨集群网络与安全
-
-跨集群抓取是整个方案的关键依赖，需从可靠性和安全性两个维度保障。
-
-**可靠性：**
-
-- **抓取间隔：** 跨集群场景下推荐 30s–60s，避免频繁的跨网请求放大瞬时故障。
-- **`for` 持续时间：** 告警规则中的 `for` 应至少为抓取间隔的 2–3 倍，防止瞬时网络波动触发误报。
-- **Pushgateway 高可用：** Pushgateway 不支持集群/复制模式，同一集群部署多实例会导致指标分裂，不是真正的 HA。正确做法：关键巡检 CronJob 直接推送到中心集群的 Pushgateway，集群侧不部署 Pushgateway 也能工作；如果仍需集群侧 Pushgateway，则 CronJob 同时向集群侧和中心侧各推一份作为冗余。
-
-**网络安全：**
-
-- 跨集群抓取链路应启用 TLS（Prometheus `scheme: https`）或 mTLS，防止指标数据在公网/专线中被窃听。
-- Exporter 端点应配置 HTTP Basic Auth 或 Bearer Token 认证，避免未授权方拉取集群指标。
-- 网络策略（NetworkPolicy）限制 Prometheus 抓取来源 IP，仅允许中心集群的抓取端 IP 通过。
-
-### 4.5 Pushgateway 指标时效性
-
-Pushgateway 中的指标在主动删除前会一直保留。如果某个 CronJob 停止推送（Pod 被驱逐、镜像拉取失败等），旧值会持续存在，导致告警永远触发或永远静默。需在告警规则中加入时效性校验：
-
-```promql
-# 示例：只告警最近 5 分钟内推过的新鲜值
-(github_probe_success == 0)
-and
-(time() - push_time_seconds{job="cronjob"}) < 300
+    CJ -->|1. push 巡检结果| CPG
+    Prom -->|2. TLS 远程拉取| KSM
+    Prom -->|2. TLS 远程拉取| NE
+    Prom -->|2. TLS 远程拉取| CPG
+    Prom -->|3. 告警推送| AM
+    AM -->|4. SMTP 发送邮件| Mailbox
+    Mailbox -->|5. 机器人轮询解析| BOT
+    BOT -->|6. 私聊通知| Staff
 ```
 
-同时应在中心侧部署定时任务，定期清理 Pushgateway 中超过阈值的陈旧指标。
+**说明：**
+- 上中下三层：通知链路（顶部）← 中心集群（中部）← 业务集群（底部），数据从下往上流
+- 业务集群以一套组件为代表（当前部署 ×10 集群），CronJob 巡检结果直推中心 Pushgateway，不经过集群侧中转
+- 中心 Prometheus HA 对通过 TLS 拉取各集群 kube-state-metrics (:8080) / node-exporter (:9100) 和中心 Pushgateway (:9091)
+- Alertmanager 负责抑制/分组/去重，统一 SMTP 出口；外部看板 DataStat 通过 Prometheus HTTP API 查询并渲染
 
-### 4.6 可扩展性与服务发现
+### 2.2 数据流图
 
-随着集群数量增长，中心 Prometheus 的资源压力和被管理目标的复杂性同步上升，需在架构层面预留扩展路径：
+> 此处建议插入数据流图，描述核心业务数据的生命周期，即威胁建模的基础。推荐使用Mermaid实现，可代码化，GitHub可渲染。
+> **不涉及需要说明原因**
 
-- **水平扩展：** Prometheus 原生不支持集群，当单实例内存/IO 触及瓶颈时，可引入 Thanos 或 VictoriaMetrics，将数据持久化与查询聚合分离到外部存储层，Prometheus 自身仅保留短窗口热数据。
-- **服务发现：** 初期可按静态文件方式管理各集群端点（`file_sd_configs`），目标列表用 Git 管理。集群数量增多后可迁移到 Consul 或 Kubernetes API 实现动态发现，避免手动维护 scrape target 列表。
-- **基数控制：** 高基数指标（如 Pod 级别、容器级别）是 Prometheus 内存的最大消耗来源。应在 scrape 阶段通过 `metric_relabel_configs` 丢弃不必要的标签，仅保留 `namespace`、`deployment` 等聚合维度标签用于告警。示例配置：
+**设计说明/归档:** 本数据流图展示了从指标产生到告警通知的完整数据生命周期，覆盖采集、传输、存储、计算、通知五个阶段。
 
+**指标数据流与告警生命周期：**
+
+```mermaid
+graph LR
+    subgraph "1. 指标产生"
+        Node["node-exporter<br/>节点系统指标"]
+        K8s["kube-state-metrics<br/>K8s 资源状态"]
+        Probe["CronJob 巡检<br/>拨测结果"]
+    end
+
+    subgraph "2. 抓取与存储"
+        Scrape["Prometheus Scrape<br/>30s-60s 间隔拉取"]
+        TSDB["Prometheus TSDB<br/>7-30 天本地存储"]
+    end
+
+    subgraph "3. 告警计算"
+        Rules["Prometheus Rules<br/>PromQL 规则评估"]
+        AM["Alertmanager<br/>分组/抑制/路由"]
+    end
+
+    subgraph "4. 通知输出"
+        Email["SMTP 邮件<br/>结构化标题"]
+        Bot["机器人解析<br/>按级别/集群分发"]
+        Staff["运维人员<br/>私聊通知"]
+    end
+
+    Node -->|暴露 :9100| Scrape
+    K8s -->|暴露 :8080| Scrape
+    Probe -->|push :9091| Scrape
+    Scrape --> TSDB
+    TSDB --> Rules
+    Rules -->|firing alert| AM
+    AM --> Email
+    Email --> Bot
+    Bot --> Staff
+```
+
+**说明：**
+- 指标采集分两类：长驻指标（node-exporter / kube-state-metrics）由 Prometheus 主动拉取；短生命周期任务（CronJob 巡检）push 到中心 Pushgateway 后被拉取
+- 告警计算全部在中心 Prometheus 完成，通过 `cluster` 标签区分来源集群
+- Alertmanager 负责抑制（inhibit）、分组（group_by）、路由和重复控制
+- 邮件标题为固定结构化格式 `[级别][集群]-告警名称[-附加标签]`，机器人解析后私聊通知
+
+### 2.3 组件职责与接口
+
+> 列出新增/修改的组件及其定义的 API 规范。**不涉及需要说明原因**
+
+**设计说明/归档:** 本体系涉及的组件分中心集群和业务集群两类，均为开源标准组件，接口协议基于 Prometheus exposition format 和 SMTP。
+
+**中心集群组件：**
+
+| 组件名称 | 职责 | 输入 | 输出 | 接口/端口 |
+|---------|------|------|------|----------|
+| **Prometheus HA 对** | 指标抓取、TSDB 存储、告警规则计算 | 各集群 exporter metrics | 告警推送至 Alertmanager | `:9090` (API), scrape 目标端口 |
+| **Alertmanager Gossip 集群 (×2)** | 告警分组、抑制、去重、SMTP 路由 | Prometheus alert 推送 | SMTP 邮件 | `:9093` (API), `:9094` (Gossip mesh) |
+| **外部看板 (DataStat)** | 仪表盘可视化、多集群统一查询 | Prometheus HTTP API | 看板渲染 | `https://beta.datastat.osinfra.cn` |
+| **Pushgateway** | 接收各集群 CronJob 巡检指标、供 Prometheus 抓取 | CronJob HTTP PUT | Prometheus metrics | `:9091` |
+
+**业务集群组件（每集群一套）：**
+
+| 组件名称 | 职责 | 输入 | 输出 | 接口/端口 |
+|---------|------|------|------|----------|
+| **kube-state-metrics** | 暴露 K8s 资源对象状态（Pod/Deploy/SA 等） | K8s API | Prometheus metrics | `:8080` |
+| **node-exporter** | 暴露节点系统指标（CPU/内存/磁盘/网络） | /proc, /sys | Prometheus metrics | `:9100` |
+| **CronJob 巡检集 (×6)** | 周期性执行拨测脚本，结果 push 至中心 Pushgateway | 外部服务（GitHub/云API/共享盘） | Pushgateway PUT | 脚本 stdout → 中心 Pushgateway :9091 |
+
+**关键接口规范：**
+
+1. **Prometheus 抓取配置（file_sd_configs）：**
 ```yaml
-metric_relabel_configs:
-  # 丢弃 Pod 维度的高基数标签
-  - action: labeldrop
-    regex: "pod|container|container_id|uid"
-  # 仅保留 deployment 级别的聚合维度
-  - action: labelkeep
-    regex: "__name__|cluster|namespace|deployment|job"
+- targets: ["cluster-a.internal:8080"]
+  labels:
+    cluster: prod-sh-1
+    job: kube-state-metrics
 ```
 
+2. **Alertmanager 邮件模板标题：**
+```go
+[{{ .Labels.severity }}][{{ .Labels.cluster }}] {{ .Labels.alertname }}{{ if .Labels.instance }}-instance-{{ .Labels.instance }}{{ end }}
+```
+
+3. **Prometheus HTTP API（对外看板查询接口）：**
+
+```bash
+# 即时查询
+GET http://<Prometheus>:9090/api/v1/query?query=github_probe_success{cluster="prod-sh-1"}
+
+# 范围查询（看板画趋势图）
+GET http://<Prometheus>:9090/api/v1/query_range?query=node_memory_MemAvailable_bytes{cluster="prod-sh-1"}&start=2026-04-01T00:00:00Z&end=2026-04-30T00:00:00Z&step=1h
+```
+
+返回标准 JSON，DataStat 看板直接调用此接口获取数据并渲染。
+
+4. **CronJob 向 Pushgateway 推送格式：**
+```bash
+cat <<EOF | curl -X PUT --data-binary @- http://pushgateway:9091/metrics/job/cronjob_probe/cluster/${CLUSTER}
+github_probe_success{cluster="${CLUSTER}"} 1
+EOF
+```
+
+5. **指标命名规范：**
+
+所有自定义指标遵循 Prometheus 命名最佳实践：
+- 前缀以探测目标命名（如 `github_`、`cloud_`、`cert_`、`disk_`、`mirror_`、`sa_`）
+- 布尔型（成功/失败）指标以 `_success` 结尾（如 `github_probe_success`）
+- 数值型指标以基础单位结尾（如 `_bytes`、`_seconds`、`_ratio`）
+- Counter 类型必须以 `_total` 结尾（Prometheus 官方规范，如 `http_requests_total`）
+- Gauge 类型不要使用 `_total` / `_count` / `_bucket` 后缀
+
+6. **必带 Label 约定：**
+
+所有指标必须包含以下 label，否则告警规则无法正确匹配和路由：
+
+| Label | 说明 | 示例值 |
+|-------|------|--------|
+| `cluster` | 来源业务集群标识 | `prod-sh-1` |
+| `job` | 指标所属 job（自动由 Prometheus scrape 注入） | `kube-state-metrics` |
+
+附加 label 按需定义，但禁止包含高基数标签（如 Pod name、container ID），避免 series 爆炸。
+
+### 2.4 UX设计
+
+> 设计目标：确保功能不仅"可用"，而且"好用"，降低开发者的认知负担和运维人员的误操作风险。 **不涉及需要说明原因**
+
+**设计说明/归档:** 不涉及。运维人员通过社区自建看板 DataStat（`https://beta.datastat.osinfra.cn/resources?community=infra`）和邮件通知交互。看板直接调用中心 Prometheus HTTP API 获取指标数据并渲染，无需额外 UX 设计。
+
+### 2.5 SOD设计
+
+> 设计目标：通过维护SOD权限设计文档，确保权限设计可审计、可复用、可跨服务重用。 SOD权限设计参考[XX SOD权限设计.md](XX%20SOD%E6%9D%83%E9%99%90%E8%AE%BE%E8%AE%A1.md)
+
+**设计说明/归档:** 本系统的职责分离由 Kubernetes RBAC + Alertmanager 路由规则实现：
+- 中心集群 `monitoring` 命名空间：监控管理员拥有 admin 权限
+- 业务集群 `monitoring` 命名空间：仅部署采集器，无需访问中心集群
+- 告警路由由办公软件机器人侧管理（不同集群通知不同运维组），监控系统自身不感知人员分工
+
+### 2.6 功能设计分解TASK清单
+
+> 任务清单、预计工时、责任人和详细执行计划已移至 **[#294 实施计划.md](#294 实施计划.md)**。实施计划按三阶段组织：Phase 1 打通单集群链路（4 人天）、Phase 2 接通机器人通知（1.5 人天）、Phase 3 批量扩展（3 人天），总计 8.5 人天。
+
 ---
 
-## 五、巡检项与告警规则设计
+## 3. 非功能设计
 
-沿用前述 9 个问题对应的巡检项，所有告警规则统一写在中心 Prometheus 的规则文件中，通过 `cluster` 标签区分来源。
+### 3.1 安全与隐私设计评估和设计
 
-| 编号 | 问题 | 巡检方式 | 关键指标 | 告警触发条件 | 严重级别 | 建议频率 |
-|------|------|---------|---------|-------------|---------|---------|
-| 1 | GitHub 不可达 | 各集群 CronJob 拨测 | `github_probe_success` | `== 0` 持续 2m | **CRITICAL** | 1m |
-| 2 | ServiceAccount 权限过大 | 每日权限合规检查 | `sa_privilege_excess` | `> 0` 持续 1h | **WARNING** | 日 |
-| 3 | 云账号欠费/冻结 | CronJob 查询云 BSS | `cloud_account_status` | `== 0` 持续 5m | **CRITICAL** | 10m |
-| 4 | 共享盘使用率过高 | CronJob df 或云监控 | `shared_disk_usage_percent` | `> 85` 持续 5m (WARNING)<br>`> 95` 持续 1m (CRITICAL) | **WARNING / CRITICAL** | 5m |
-| 5 | 代理证书过期/代理宕机 | CronJob 证书检查 + 连通性拨测 | `proxy_cert_days_left`<br>`proxy_reachable` | `< 30` 天 (WARNING)<br>`== 0` 持续 2m (CRITICAL) | **WARNING / CRITICAL** | 证书日检<br>连通性 10m |
-| 6 | 代码仓镜像同步失败 | CronJob 检查同步状态 | `mirror_sync_success` | `== 0` 持续 1h | **WARNING** | 日检/同步后触发 |
-| 7 | Pod OOM 用户无感知 | kube-state-metrics 提供 OOM 计数；CI 模板自动评论 | `kube_pod_container_status_terminated_reason` | 10m 内出现 OOM 增量 `> 0` | **INFO** | 实时 |
-| 8 | Runner 副本不可用 | kube-state-metrics 监控 Deployment 副本 | `kube_deployment_status_replicas_available` | `== 0` 持续 2m | **CRITICAL** | 实时 |
-| 9 | 调度积压 | kube-state-metrics 统计 Pending Pod | `kube_pod_status_phase` | Pending Pod `> 5` 持续 5m | **WARNING** | 实时 |
+> 关注点：防御能力与合规边界。
 
-> **注：** 问题 7 的用户通知仍然建议在 CI 流程内完成（自动 PR 评论），而 INFO 级别邮件仅作为运维侧统计参考，机器人可按标题规则静默处理或转发至内部群。
->
-> **PromQL 实现提示：** 问题 7 使用 `kube_pod_container_status_terminated_reason{reason="OOMKilled"}` 做增量检测时，该指标为 counter 类型，需使用 `increase()` 函数并注意 counter 重置场景。表达式示例：
-> ```promql
-> increase(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[10m]) > 0
-> ```
->
-> **数据持久化说明：** 本文档未包含长期存储方案。中心 Prometheus 默认保留 15 天数据，如需更长保留期或跨集群长期存储，可在后续引入 Thanos 或 VictoriaMetrics 作为附加层，但不影响当前架构的核心逻辑。
+### 3.1.1 威胁分析 (Threat Modeling)
+
+> 基于 **STRIDE** 或类似模型，识别本项目可能面临的安全威胁。推荐使用Mermaid绘制DFD数据流图和信任边界，展示系统的安全边界和数据流向。
+> **建议归档服务模块设计图，后续需要可增量复用（导入设计文件到工具中即可复用增量设计）。**
+
+**设计说明/归档:** 本威胁分析基于 STRIDE 模型，针对跨集群监控体系的三层信任边界，识别指标采集、传输、存储、告警通知全链路的安全威胁。
+
+**威胁建模 — 信任边界图：**
+
+```mermaid
+graph TB
+    subgraph "攻击面"
+        direction LR
+        Attacker["攻击者"]
+        Leak["指标数据窃听"]
+        Spoof["伪造指标注入"]
+        CredTheft["凭据窃取"]
+    end
+
+    subgraph "信任边界 1 · 中心集群 [高信任]"
+        direction LR
+        PromT["Prometheus TSDB"]
+        AMT["Alertmanager"]
+        SecT["Secret: SMTP 凭据"]
+    end
+
+    subgraph "信任边界 2 · 业务集群 [中信任]"
+        direction LR
+        KSMT["kube-state-metrics"]
+        NET["node-exporter"]
+        CJT["CronJob 巡检"]
+        SecC["Secret: 云 AK/SK"]
+    end
+
+    subgraph "信任边界 3 · 外部服务 [低信任]"
+        direction LR
+        GitHubT["GitHub API"]
+        CloudT["云 BSS API"]
+        SMTPT["SMTP 服务器"]
+        MailT["企业邮箱"]
+        BotT["机器人"]
+    end
+
+    PromT -->|跨边界: TLS 抓取| KSMT
+    PromT -->|跨边界: TLS 抓取| NET
+    CJT -->|跨边界: push| PromT
+    CJT -->|API 调用| GitHubT
+    CJT -->|API 调用| CloudT
+    AMT -->|跨边界: SMTP 认证| SMTPT
+    SMTPT --> MailT
+    MailT --> BotT
+    PromT -->|内部: 告警推送| AMT
+
+    Attacker -.-> Leak
+    Attacker -.-> Spoof
+    Attacker -.-> CredTheft
+    Leak -.->|窃听抓取链路| PromT
+    Spoof -.->|伪造推送指标| PromT
+    CredTheft -.->|窃取凭据| SecT
+    CredTheft -.->|窃取凭据| SecC
+```
+
+**说明：**
+- 三层信任边界自上而下信任递减：中心集群（完全受控）→ 业务集群（多团队共享）→ 外部服务（不受控）
+- 跨越边界的数据流标注为高风险点：Prometheus 跨集群抓取（TLS）、CronJob 访问云 API、Alertmanager SMTP 认证
+- 攻击面集中在传输窃听（抓取链路）、伪造注入（Pushgateway）、凭据窃取（Secret）三类
+
+**威胁分析表：**
+
+| 威胁类别 | 攻击场景描述 (Scenario) | 风险等级 | 对应减缓措施 (Mitigation) |
+|---------|------------------------|---------|--------------------------|
+| **信息泄露** | 跨集群抓取链路未加密，攻击者窃听获取集群指标数据（含 Pod 名、节点 IP 等敏感信息） | 高 | 全链路启用 TLS 1.2+ / mTLS；NetworkPolicy 限制抓取来源 IP |
+| **信息泄露** | SMTP 凭据明文存储在 ConfigMap 中，被未授权访问者读取 | 高 | SMTP 凭据存入 Kubernetes Secret；启用 etcd 静态加密 |
+| **信息泄露** | 外部看板未配置认证，匿名用户可访问所有集群指标面板 | 高 | 看板接入 OAuth2/OIDC 认证，未登录禁止访问；限制数据源 IP 为看板服务器出口 IP |
+| **信息泄露** | 云账号 AK/SK 存储在 CronJob 环境变量中，被 Pod 内其他进程读取 | 高 | AK/SK 存入 Secret 并通过 envFrom 引用；CronJob 容器以非 Root 运行 |
+| **篡改/伪造** | 攻击者向中心 Pushgateway 推送伪造指标，触发虚假告警或掩盖真实故障 | 中 | Pushgateway 端点配置 HTTP Basic Auth；网络策略限制推送来源 IP |
+| **篡改/伪造** | 攻击者篡改中心 Prometheus 规则文件，禁用关键告警或注入恶意规则 | 中 | 规则文件通过 GitOps (ArgoCD) 管理，变更需 MR 评审；Prometheus 配置开启只读模式 |
+| **权限提升** | CronJob 使用的云 API AK/SK 权限过大（如 Admin），攻击者可利用其操作云资源 | 中 | 实施最小权限原则：云 AK/SK 仅授予 BSS ReadOnly / SFS ReadOnly |
+| **拒绝服务** | 攻击者向 Pushgateway 大量推送高基数指标，导致 Prometheus 内存耗尽 (OOM) | 中 | Pushgateway 端点限流；Prometheus 配置 `metric_relabel_configs` 过滤高基数标签 |
+| **拒绝服务** | Alertmanager SMTP 连接被限流或阻断，告警邮件全部丢失 | 中 | 配置 webhook 备用通知通道；监控 `alertmanager_notifications_failed_total` 指标 |
+| **隐私泄露** | Prometheus 日志中记录了查询参数（可能含敏感 namespace/Pod 名），被非授权人员查看 | 低 | 日志访问限制在 `monitoring` 命名空间管理员 |
+| **抵赖 (Repudiation)** | 运维人员通过 Alertmanager API 手动创建 silence 屏蔽告警后，无审计记录追溯"谁在何时静默了哪个告警" | 中 | Alertmanager API 调用记录归档至操作日志；GitOps 管理的 silence 规则文件变更需 MR 评审并保留 commit 记录 |
+| **重放攻击** | 攻击者截获并重放 CronJob 向 Pushgateway 的推送请求 | 低 | Pushgateway 指标具有幂等性（PUT 覆盖同名指标），重放不影响数据正确性 |
+
+**参考资料：**
+- 详见《架构设计说明书编写经验》第8章：威胁建模中的信任边界设计
+- 详见《架构设计说明书编写经验》第16-20章：Mermaid图表应用指南
+
+### 3.1.2 安全设计实现 (Security Mechanisms)
+
+**设计说明/归档:** 针对威胁分析识别的 12 个威胁场景，从凭证管理、身份认证、传输加密、运行时隔离、日志审计五个维度实施安全控制。
+
+* **凭证管理**：
+  - SMTP 密码、云 AK/SK 严禁硬编码，统一存储于 Kubernetes Secret
+  - Secret 通过 `envFrom.secretRef` 注入 CronJob Pod，不写入容器镜像或 ConfigMap
+  - 云 AK/SK 采用最小权限策略（BSS ReadOnly、SFS ReadOnly），定期轮转（建议 90 天）
+  - 中心集群 Secret 与业务集群 Secret 隔离，业务集群管理员不可访问中心凭据
+
+* **身份认证与授权**：
+  - 跨集群抓取启用 HTTP Basic Auth 或 Bearer Token（各 exporter 端点配置 `--web.auth.config`）
+  - 外部看板 DataStat 需接入认证（OAuth2/OIDC），限制 Prometheus API 访问来源 IP
+  - Kubernetes RBAC：中心集群 `monitoring` 命名空间仅监控管理员可写；业务集群 `monitoring` 命名空间部署权限最小化
+  - NetworkPolicy：中心 Prometheus 抓取来源 IP 白名单，业务集群仅允许中心集群出口 IP
+
+* **数据安全**：
+  - 跨集群抓取链路启用 TLS 1.2+（Prometheus `scheme: https`，`tls_config` 配置 CA 证书）
+  - 跨信任边界的 mTLS 链路（Prometheus 与 exporter 双向证书验证）
+  - 指标数据传输过程不包含 Secret、Token 等敏感凭据
+  - PVC 存储依赖华为云 EVS 加密（云平台侧静态加密）
+
+* **运行时隔离**：
+  - CronJob 容器以非 Root 用户运行（`securityContext.runAsNonRoot: true`）
+  - 容器文件系统设为只读（`readOnlyRootFilesystem: true`），防止二进制篡改
+  - Prometheus / Alertmanager 容器限制网络出站（仅允许必要的目标端口）
+  - Prometheus API 仅开放内网访问，不暴露至公网
+
+* **日志审计**：
+  - Alertmanager 告警通知日志包含 4W 信息：Who（Alertmanager 实例）、When（firing 时间）、Where（目标集群）、What（alertname + 当前值）
+  - Prometheus 规则变更走 Git 提交记录，可追溯每次修改的 author / diff / timestamp
+  - 禁止在日志中记录完整 SMTP 密码或云 AK/SK
+
+> 安全任务清单（SEC-TASK1 ~ SEC-TASK7）已移至 **[#294 实施计划.md §2.1](#294 实施计划.md)**。
+
+### 3.2 可靠性与韧性设计评估和设计
+
+> **关注点**：极端情况下的生存与恢复能力。
+
+**设计说明/归档:** 本系统属于 CI/CD 基础设施的核心监控组件，需满足高可用要求。以下从冗余设计、降级策略、数据恢复三个维度说明。
+
+**冗余设计：**
+
+- **Prometheus HA 对：** 两个独立实例抓取相同目标，各自保留完整 TSDB。单实例宕机不影响告警计算和通知。
+- **Alertmanager Gossip 集群 (×2)：** 共享告警状态（silence / inhibition / 已发送通知），单实例宕机不丢告警、不重复发送。
+- **外部看板 (DataStat) 独立于监控集群：** 看板不可用时不影响告警通路，告警仍通过 SMTP 正常发送。
+- **业务集群采集器单实例：** 采集器故障仅影响本集群（且关键 CronJob 直推中心 Pushgateway 冗余）。
+
+**降级策略：**
+
+- 跨集群网络中断 → Prometheus 停止抓取 → 指标断点 → `for: 2m` 窗口内不触发告警 → 网络恢复后数据补齐（Prometheus 不回溯历史空洞，但不影响后续告警）
+- SMTP 服务器不可用 → Alertmanager 内部重试 + 指数退避 → 同时监控 `alertmanager_notifications_failed_total` 触发独立告警
+- 中心 Pushgateway 宕机 → CronJob 仅推集群侧 Pushgateway → 巡检指标降级为单路径（仍有数据）
+
+**中心集群整体宕机兜底：**
+
+以上冗余设计仅覆盖组件级故障。当中心集群整体宕机（如云区域故障、机房断电、etcd 集群损坏）时，所有告警通路同时中断。兜底策略如下：
+
+- **Meta-monitoring 独立部署**：Meta-monitoring 拨测器部署于业务集群之一（与中心集群无依赖关系），定时探测中心 Prometheus / Alertmanager / Pushgateway 存活状态
+- **告警通道分离**：Meta-monitoring 告警走 **IM webhook 直推**（办公软件机器人），不经过中心 SMTP。即使中心集群与 SMTP 同时不可用，运维人员仍可收到 Meta-monitoring 不可用告警
+- **恢复流程**：中心集群重建后，Prometheus PVC 通过 EVS 快照恢复 → 组件通过 Helm/ArgoCD 重新部署 → 告警规则通过 Git 仓库重新同步
+- **注意**：中心集群宕机期间业务集群告警无法发出，此为可接受风险（MTTR < 30 分钟），由 P3 批量接入时在各集群增加独立告警通知作为后续演进
+
+**数据恢复：**
+
+- Prometheus TSDB 使用 PVC 持久化，Pod 重建后数据完整恢复
+- PVC 备份依赖华为云 EVS 快照策略（由平台侧配置）
+- Alertmanager 静默规则在重启后丢失（Gossip 集群可恢复活跃静默），建议静默操作通过 API 执行并记录审计
+
+> 可靠性与韧性任务清单（REL-TASK1 ~ REL-TASK4）已移至 **[#294 实施计划.md §2.2](#294 实施计划.md)**。
 
 ---
 
-## 六、扩展新集群
+### 3.3 可服务性与可观测性评估和设计
 
-加入监控体系仅需：
+> **关注点**：排障效率与全生命周期管理，确保故障可感知、可定位、可修复。
 
-1. 在新集群部署标准化采集组件包（kube-state-metrics, node-exporter, Pushgateway, CronJob 集）。
-2. 确保中心 Prometheus 能访问新集群的 Pushgateway 及 exporter 端点。
-3. 在中心 Prometheus scrape 配置中新增对应 job，附带 `cluster` 标签。
+**设计说明/归档:** 本系统自身即是一个可观测性平台，以下从监控自检、排障手段、变更管理三个维度说明。Meta-monitoring 拨测器的部署位置和兜底链路详见 §3.2"中心集群整体宕机兜底"。
 
-告警规则自动覆盖新集群，邮件标题自动携带集群标识。
+**监控自检 (Meta-monitoring)：**
+
+- 中心集群外部部署独立拨测器，定时探测 Prometheus `/-/healthy`、Alertmanager `/-/healthy`、Pushgateway `/metrics`、SMTP 连通性
+- 拨测告警走独立于邮件之外的通知通道（IM webhook），确保邮件系统故障时仍可感知
+- 关键自检指标：
+  - `prometheus_tsdb_head_series`（两个 HA 实例差异 > 20% → 告警）
+  - `alertmanager_notifications_failed_total`（增量 > 0 → 告警）
+  - `kube_job_status_failed{job_name=~".*probe.*"}`（CronJob 失败 → 告警）
+  - `time() - cronjob_last_run_timestamp > 600`（CronJob 心跳超时 → 告警）
+
+**排障手段：**
+
+- 提供错误码对照表：
+
+| 现象 | 可能原因 | 排查步骤 |
+|------|---------|---------|
+| Prometheus target DOWN | 跨集群网络不通 / 证书过期 / exporter 宕机 | `curl -v` 从中心集群测目标端点；`kubectl logs` exporter Pod |
+| 告警未触发 | 规则语法错误 / `for` 未满足 / 指标消失 | `promtool check rules` 校验；Prometheus `/rules` 页面查规则状态 |
+| 邮件未收到 | SMTP 限流 / 密码过期 / Alertmanager 路由错误 | `kubectl logs alertmanager-0`；`swaks` 测试 SMTP 连通性 |
+| Pushgateway 指标陈旧 | CronJob 未执行 / 脚本报错 | `kubectl get jobs -n monitoring`；查看 CronJob 最近执行日志 |
+
+**变更管理：**
+
+- 所有 Prometheus 规则、Alertmanager 配置、CronJob 脚本通过 Git 管理，ArgoCD 自动同步
+- 告警规则变更需 `promtool check rules` 通过后方可合并
+- 新增集群接入使用标准化 Helm Chart / Kustomize overlay，避免手动逐集群操作
+
+> 可服务性任务清单（OBS-TASK1 ~ OBS-TASK4）已移至 **[#294 实施计划.md §2.3](#294 实施计划.md)**。
 
 ---
 
-## 七、运维配套
+### 3.4 性能与伸缩性评估和设计
 
-### 7.1 维护窗口告警静默
+> **关注点**：资源模型、水平扩展路径、基数控制。
 
-计划内维护（集群升级、节点重启等）会触发预期内的告警，需提前配置 Alertmanager Silence 或 Prometheus 抑制规则，避免告警风暴。Silence 可通过 Alertmanager API/UI 按 `cluster` + `alertname` 匹配创建，设定起止时间，维护结束后自动失效。
+**设计说明/归档:** 本系统需支持从 1-2 个集群验证期平滑扩展到 10+ 集群满配。以下从资源模型、扩展路径、基数控制三个维度说明。
 
-### 7.2 告警去重与分组
+**资源模型（10 集群 / 50 节点/集群 / 450K active series）：**
 
-Alertmanager 的 Gossip 集群（见 2.1 节）本身保证同一告警不会重复发送。此外应配置 `group_by`（按 `cluster` + `alertname` 分组）和 `group_interval`，将同一分组的多个 firing 实例合并到一封邮件中，避免邮件刷屏。
+| | 中心集群 | 单业务集群 | 说明 |
+|---|---------|-----------|------|
+| CPU request | **8.5C** | **700m** | 中心 Prometheus HA 对占 8C，业务集群 node-exporter DaemonSet 占大头 |
+| 内存 request | **33Gi** | **3.5Gi** | 中心 Prometheus HA 对占 32Gi |
+| 磁盘 (30天) | **170Gi** | — | 仅中心 Prometheus PVC，业务集群无持久化 |
+
+> **资源估算依据**（基于 Prometheus 官方容量规划公式）：
+> - 每 sample 约 2 bytes（磁盘）；每 active series 约 8 KiB（内存，含索引和 head chunk）
+> - 450K active series × 8 KiB ≈ 3.6 GiB（HA 对 ×2 = 7.2 GiB，加上查询开销和安全水位，request 32 GiB）
+> - 磁盘：450K × 30d × 86400s/60s interval × 2 bytes ≈ 38.88 GB → 实体盘 frag + 预留 ≈ 170 GiB（含 WAL / compaction 空间）
+> - CPU：根据 Prometheus `prometheus_engine_query_duration_seconds` 经验，450K series 需约 4C；HA 对 ×2 + Alertmanager + Pushgateway ≈ 8.5C
+> - 以上为经验估算，实际部署后需根据 DataStat 资源水位面板持续调优
+
+**水平扩展路径：**
+
+- **Prometheus 单实例上限：** 约 500K-1M active series（受内存限制）。当前 450K series 在安全水位内。
+- **触发 Thanos/VictoriaMetrics 引入条件：** 单实例内存 > 64Gi，或集群数 > 20，或需跨全局查询
+- **业务集群采集器：** 每集群独立，互不影响。新增集群仅增加本集群的采集器资源，不影响中心 Prometheus 抓取性能（仅增加 scrape target 数量）
+- **服务发现演进：** 初期使用 `file_sd_configs` 静态文件（Git 管理）→ 后期可迁移到 Consul 或 Kubernetes API SD 动态发现
+
+**网络方向与架构迁移条件：**
+
+当前架构混合了两种数据通路方向：
+- **中心拉取**（Prometheus → 业务集群 :8080 / :9100）：依赖中心出向连通
+- **业务推送**（CronJob → 中心 Pushgateway :9091）：依赖业务出向连通
+
+如果将来收紧业务集群访问中心集群的策略（业务集群通常仅有内网出向），Pushgateway 推送路径可能中断。两种迁移方向：
+
+| 场景 | 方案 | 代价 |
+|------|------|------|
+| 收紧业务 → 中心访问 | CronJob 改为写入本地 textfile，node-exporter `--collector.textfile.directory` 暴露，统一走拉取路径 | 每个业务集群需配置 textfile collector |
+| 收紧中心 → 业务访问 | 业务集群部署本地 Prometheus Agent + Remote Write，中心 Prometheus 仅做全局查询 | 运维复杂度大幅增加，需引入 Thanos |
+| 维持现状 | 确保 NetworkPolicy / 安全组双向放行，Influx Pushgateway + TLS | 无额外成本，需定期审计防火墙策略 |
+
+当前推荐维持现状，触发迁移条件：业务集群侧安全审计要求关闭非必要出站端口，或集群数 > 20 拉取性能出现瓶颈。
+
+**基数控制（关键性能保障）：**
+
+- 在 scrape 阶段通过 `metric_relabel_configs` 丢弃高基数标签：
+  ```yaml
+  metric_relabel_configs:
+    - action: labeldrop
+      regex: "pod|container|container_id|uid"
+    - action: labelkeep
+      regex: "__name__|cluster|namespace|deployment|job"
+  ```
+- 抓取间隔从默认 15s 放宽至 60s（跨集群场景），减少 75% 的样本摄入量
+- Pushgateway 定时清理陈旧指标，避免无效 series 堆积
+
+> 性能任务清单（PERF-TASK1 ~ PERF-TASK3）已移至 **[#294 实施计划.md §2.4](#294 实施计划.md)**。
 
 ---
 
-## 八、总结
+## 4. 实施信息
 
-本设计围绕**多集群统一监控、统一邮件出口、外部机器人分发**三大原则，以轻量采集、集中告警、结构化标题的方式，实现了：
-
-- 基础架构团队从"被动响应"转向"主动发现"的运维模式转变。
-- 监控系统自身不依赖复杂的通知渠道配置，保持简单稳定。
-- 与办公软件机器人的解耦，让告警路由可自由定制且易于管理。
-
-实施团队可按阶段落地：**先搭建中心监控集群，再逐个接入业务集群，最后对接机器人完成闭环通知。**
+实施任务、风险评估、回滚方案和详细执行步骤详见 **[#294 实施计划.md](#294 实施计划.md)**：
+- §1 三阶段任务清单 + 工时
+- §2 非功能任务（SEC / REL / OBS / PERF）
+- §3 风险与回滚方案、成本评估、风险登记
+- §4 详细执行计划（命令、配置、验证方法）
